@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+SmartDriverLiveCapture-*/
+*.zip
+*.zip.sha256
+graphify-out/
