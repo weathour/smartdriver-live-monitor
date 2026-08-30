@@ -8,9 +8,9 @@ SmartDriver Live Monitor 是一套不依赖第三方 Python 包的 Redis 与 UDP
 2. Python 应用是否收到了指定组播地址上的 UDP 数据报，是否有重复、乱序或尾随字节。
 3. 一次录制能否完整停止、校验并打包成便于机器读取和跨电脑转移的文件。
 
-同一份 `smartdriver_monitor.py` 同时支持 Windows 图形界面、Windows 无界面录制和 Linux 无界面录制。核心录制逻辑不分叉。
+同一份 `smartdriver_monitor.py` 同时支持 Windows 与 Linux 图形界面，也支持两端的无界面录制。核心接收和录制逻辑不分叉。
 
-当前版本：`1.1`
+当前版本：`1.2`
 
 ## 能录到什么
 
@@ -26,6 +26,8 @@ SmartDriver Live Monitor 是一套不依赖第三方 Python 包的 Redis 与 UDP
 - `Sensor_CVP`
 
 工具也会定期执行 `SCAN`，把发现的其他字符串键纳入录制，并记录键名、Redis 类型、是否由扫描发现、是否属于 Unity 当前键或旧版候选键。每次轮询都会保留一条时间线记录；相同内容只保存一份原始二进制文件，通过 SHA-256 引用，避免重复占用空间。
+
+Redis 兼容策略以 Unity 的实际读取权限为下限：DB 0 不发送 `SELECT`；`SCAN` 或 `TYPE` 不可用时仍读取六个固定键；`MGET` 被权限规则拒绝或服务器不支持时，当前连接自动改用逐键 `GET`。`discovery_method` 和 `read_method` 会把实际模式写入 JSONL；降级和单键读取错误也会写入运行日志，不会把“无权读取”伪装成“键不存在”。
 
 ### UDP
 
@@ -69,9 +71,10 @@ SmartDriver Live Monitor 是一套不依赖第三方 Python 包的 Redis 与 UDP
 - Python 3.10 或更高版本
 - 不需要 `pip install`
 - Windows 图形界面需要 Python 自带的 Tcl/Tk
-- Linux 推荐使用无界面模式，不需要桌面环境或 Tcl/Tk
+- Linux 图形界面需要图形桌面、Tkinter 和可显示中文的系统字体
+- Linux 服务器可以使用无界面模式，不需要桌面环境或 Tcl/Tk
 
-项目的持续集成会在 Windows 和 Ubuntu 上分别使用 Python 3.10 与 3.12 运行同一套自检。
+项目的持续集成会在 Windows 和 Ubuntu 上分别使用 Python 3.10 与 3.12 运行同一套离线自检，并实际创建一次 Tk 窗口。Ubuntu 的窗口检查运行在虚拟显示器中。
 
 ## 下载
 
@@ -114,6 +117,36 @@ py -3 smartdriver_monitor.py --headless --duration-seconds 60 --archive
 ```
 
 ## Linux 使用方法
+
+### 图形界面
+
+Ubuntu 或 Debian 先安装 Tkinter 和中文字体：
+
+```bash
+sudo apt install python3-tk fonts-noto-cjk
+```
+
+其他发行版请安装其 Python Tk/Tkinter 软件包和中文字体，然后在图形桌面中运行：
+
+```bash
+./Start-SmartDriver-Monitor.sh
+```
+
+也可以直接运行：
+
+```bash
+python3 smartdriver_monitor.py
+```
+
+启动参数会作为图形界面的初始值，例如连接旧版开发环境：
+
+```bash
+./Start-SmartDriver-Monitor.sh --redis-host 192.168.0.108
+```
+
+界面、操作步骤和录制结果与 Windows 相同。
+
+### 无界面录制
 
 先运行离线自检：
 
@@ -165,6 +198,8 @@ VERIFY_CAPTURE=OK
 - 发送端确实在发 UDP 时，`counts.udp` 应大于零。
 - `last_error` 应为 `null`。
 
+同时查看控制台或 `events.jsonl`：如果出现 `using configured Unity keys` 或 `using individual GET commands`，说明工具已进入兼容降级，但固定 Unity 键仍会继续读取。某个键出现 `Redis GET failed` 则表示该键未被伪装为缺失，需要检查它的 ACL 或数据类型。
+
 `VERIFY_CAPTURE=OK` 只说明已有文件结构、摘要、行数和引用关系一致，不说明现场一定存在 Redis 或 UDP 流量。流量是否满足要求仍要看计数和内容。
 
 ## 常用参数
@@ -173,7 +208,7 @@ VERIFY_CAPTURE=OK
 | --- | --- | --- |
 | `--self-test` | 无 | 离线检查解析器、录制器、校验器和打包器 |
 | `--headless` | 无 | 不启动 Tk，适用于 Windows 和 Linux |
-| `--redis-host` | `192.168.2.112` | Redis 地址 |
+| `--redis-host` | `192.168.2.112` | Redis 地址；也作为图形界面的初始值 |
 | `--redis-port` | `6379` | Redis 端口 |
 | `--redis-database` | `0` | Redis 数据库编号 |
 | `--udp-group` | `239.255.76.21` | IPv4 组播地址 |
@@ -220,11 +255,13 @@ ZIP 内保留顶层录制目录，便于解压多个批次而不互相覆盖。�
 
 ### Redis 一直连接失败
 
-检查目标地址、端口、数据库编号、路由、防火墙和 Redis 服务状态。工具不支持 Redis 密码或 TLS；如果现场 Redis 启用了其中任一项，需要先明确接口方案。
+检查目标地址、端口、数据库编号、路由、防火墙和 Redis 服务状态。DB 0 不需要 `SELECT` 权限；非零 DB 仍需要。工具不支持 Redis 密码或 TLS；如果现场 Redis 启用了其中任一项，需要先明确接口方案。
+
+当前版本也不处理 Redis Cluster 的 `MOVED/ASK` 重定向，不应把 `CROSSSLOT` 错误解释为已经兼容集群。
 
 ### Redis 已连接，但某个键一直为空
 
-查看 `redis-inventory.jsonl`，确认键名、大小写和类型。工具会记录不存在的目标键，但只有 Redis 类型为 `string` 或 `none` 的键进入批量读取。
+查看 `redis-inventory.jsonl`，确认键名、大小写和类型。扫描可用时，只有 Redis 类型为 `string` 或 `none` 的键进入读取；扫描不可用时，工具直接逐个尝试六个固定键，并在 `events.jsonl` 记录失败。
 
 ### UDP 状态为监听中，但计数为零
 
@@ -232,7 +269,7 @@ ZIP 内保留顶层录制目录，便于解压多个批次而不互相覆盖。�
 
 ### Linux 报告 Tkinter 不可用
 
-使用 `--headless`。Linux 录制不依赖图形界面。
+Ubuntu/Debian 安装 `python3-tk fonts-noto-cjk`，并从图形桌面运行。如果机器没有显示服务（例如纯 SSH 服务器），使用 `--headless`；无界面录制不依赖 Tk。
 
 ### 目录无法通过校验
 
@@ -247,7 +284,7 @@ ZIP 内保留顶层录制目录，便于解压多个批次而不互相覆盖。�
 - 原始字节先落盘，再执行协议解析。
 - 解析错误、重复、乱序和尾随数据都保留。
 - 磁盘时间线与界面显示相互独立。
-- Windows 和 Linux 共用同一个录制核心。
+- Windows 和 Linux 共用同一个图形界面与录制核心。
 - 仅使用 Python 标准库，降低现场安装风险。
 - 状态文案区分已验证事实和需要系统级工具确认的边界。
 - 格式变化必须更新版本、校验器和格式文档。

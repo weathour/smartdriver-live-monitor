@@ -1,6 +1,6 @@
 # SmartDriver 录制格式 v2
 
-本文说明 SmartDriver Live Monitor `1.1` 写出的 `format_version: 2`。该格式把时间线、原始内容、运行环境和完整性信息分开保存，便于脚本逐行读取，也便于整包转移。
+本文说明 SmartDriver Live Monitor `1.2` 写出的 `format_version: 2`。该格式把时间线、原始内容、运行环境和完整性信息分开保存，便于脚本逐行读取，也便于整包转移。
 
 ## 目录结构
 
@@ -77,6 +77,7 @@ Redis 键清单只在录制开始或清单发生变化时写入。
 | `type` | `redis_inventory` |
 | `observed_at_utc` | 观察时间 |
 | `endpoint` | `host:port/dbN` |
+| `discovery_method` | `scan` 表示成功扫描，`configured` 表示命令受限后仅使用固定键 |
 | `keys` | 键条目数组 |
 
 每个 `keys` 条目包含：
@@ -97,7 +98,8 @@ Redis 键清单只在录制开始或清单发生变化时写入。
 | `sequence` | 轮询序号，同一轮的多个键共享序号 |
 | `observed_at_utc` | UTC 观察时间 |
 | `monotonic_ns` | 本机单调时钟纳秒值，只适合同一进程内排序和计算间隔 |
-| `round_trip_ms` | 本轮 `MGET` 往返耗时 |
+| `round_trip_ms` | 本轮 `MGET` 或全部兼容 `GET` 的总往返耗时 |
+| `read_method` | 本轮使用 `mget` 或兼容降级后的 `get` |
 | `endpoint` | Redis 端点 |
 | `key` | Redis 键名 |
 | `redis_type` | 最近一次扫描得到的类型 |

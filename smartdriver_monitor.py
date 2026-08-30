@@ -21,7 +21,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 UNITY_REDIS_KEYS = (
     "Sensor_Location",
     "Sensor_Mmobstacles",
@@ -600,6 +600,10 @@ class RedisProtocolError(RuntimeError):
     pass
 
 
+class RedisCommandError(RedisProtocolError):
+    pass
+
+
 class RedisConnection:
     def __init__(self, host, port, database, timeout=2.0):
         self.host = host
@@ -613,9 +617,10 @@ class RedisConnection:
         self.sock = socket.create_connection((self.host, self.port), self.timeout)
         self.sock.settimeout(self.timeout)
         self.stream = self.sock.makefile("rwb", buffering=0)
-        response = self.command("SELECT", str(self.database))
-        if response != "OK":
-            raise RedisProtocolError("Redis SELECT failed: %r" % (response,))
+        if self.database:
+            response = self.command("SELECT", str(self.database))
+            if response != "OK":
+                raise RedisProtocolError("Redis SELECT failed: %r" % (response,))
 
     def close(self):
         try:
@@ -661,7 +666,7 @@ class RedisConnection:
         if marker == b"+":
             return self._read_line().decode("utf-8", errors="replace")
         if marker == b"-":
-            raise RedisProtocolError(self._read_line().decode("utf-8", errors="replace"))
+            raise RedisCommandError(self._read_line().decode("utf-8", errors="replace"))
         if marker == b":":
             return int(self._read_line())
         if marker == b"$":
@@ -974,49 +979,97 @@ class RedisWorker:
         next_scan = 0.0
         inventory_event = None
         inventory_signature = None
+        discovery_enabled = True
+        read_mode = "mget"
+        reported_get_errors = {}
         while not self.stop_event.is_set():
             started = time.perf_counter()
             now = time.monotonic()
-            if now >= next_scan:
-                seen = connection.scan_keys()
-                candidates = sorted(set(UNITY_REDIS_KEYS + LEGACY_REDIS_KEYS + tuple(seen)))
-                inventory = []
-                capture_keys = []
-                for key in candidates:
-                    key_type = connection.command("TYPE", key)
-                    inventory.append({
+            if discovery_enabled and now >= next_scan:
+                try:
+                    seen = connection.scan_keys()
+                    candidates = sorted(set(UNITY_REDIS_KEYS + LEGACY_REDIS_KEYS + tuple(seen)))
+                    new_inventory = []
+                    new_capture_keys = []
+                    new_key_types = {}
+                    for key in candidates:
+                        key_type = connection.command("TYPE", key)
+                        new_inventory.append({
+                            "key": key,
+                            "type": key_type,
+                            "seen_by_scan": key in seen,
+                            "unity_key": key in UNITY_REDIS_KEYS,
+                            "legacy_candidate": key in LEGACY_REDIS_KEYS,
+                        })
+                        new_key_types[key] = key_type
+                        if key_type in ("string", "none"):
+                            new_capture_keys.append(key)
+                except RedisCommandError as exc:
+                    discovery_enabled = False
+                    discovery_method = "configured"
+                    capture_keys = list(UNITY_REDIS_KEYS)
+                    key_types = {}
+                    new_inventory = [{
                         "key": key,
-                        "type": key_type,
-                        "seen_by_scan": key in seen,
-                        "unity_key": key in UNITY_REDIS_KEYS,
+                        "type": "unknown",
+                        "seen_by_scan": False,
+                        "unity_key": True,
                         "legacy_candidate": key in LEGACY_REDIS_KEYS,
-                    })
-                    key_types[key] = key_type
-                    if key_type in ("string", "none"):
-                        capture_keys.append(key)
-                signature = tuple((item["key"], item["type"]) for item in inventory)
-                event = {
+                    } for key in capture_keys]
+                    self._publish_log(
+                        "WARN", "Redis SCAN/TYPE unavailable; using configured Unity keys: %s" % exc)
+                else:
+                    discovery_method = "scan"
+                    capture_keys = new_capture_keys
+                    key_types = new_key_types
+                    next_scan = now + self.scan_interval
+                signature = tuple((item["key"], item["type"]) for item in new_inventory)
+                inventory_event = {
                     "type": "redis_inventory",
                     "observed_at_utc": utc_now(),
                     "endpoint": endpoint,
-                    "keys": inventory,
+                    "discovery_method": discovery_method,
+                    "keys": new_inventory,
                 }
-                self.bus.publish(event)
-                inventory_event = event
                 inventory_signature = signature
-                next_scan = now + self.scan_interval
+                self.bus.publish(inventory_event)
             if inventory_event is not None:
                 self._record_inventory(inventory_event, inventory_signature)
 
             request_started = time.perf_counter()
-            values = connection.command("MGET", *capture_keys) if capture_keys else []
+            items = []
+            if read_mode == "mget" and capture_keys:
+                try:
+                    values = connection.command("MGET", *capture_keys)
+                except RedisCommandError as exc:
+                    detail = str(exc).lower()
+                    if not any(marker in detail for marker in ("noperm", "unknown command")):
+                        raise
+                    read_mode = "get"
+                    self._publish_log(
+                        "WARN", "Redis MGET unavailable; using individual GET commands: %s" % exc)
+                else:
+                    if not isinstance(values, list) or len(values) != len(capture_keys):
+                        raise RedisProtocolError("MGET value count mismatch")
+                    items = list(zip(capture_keys, values))
+            if read_mode == "get":
+                for key in capture_keys:
+                    try:
+                        payload = connection.command("GET", key)
+                    except RedisCommandError as exc:
+                        detail = str(exc)
+                        error_state = (detail, self.capture.generation)
+                        if reported_get_errors.get(key) != error_state:
+                            self._publish_log("WARN", "Redis GET failed for %s: %s" % (key, detail))
+                            reported_get_errors[key] = error_state
+                        continue
+                    reported_get_errors.pop(key, None)
+                    items.append((key, payload))
             round_trip_ms = (time.perf_counter() - request_started) * 1000.0
-            if len(values) != len(capture_keys):
-                raise RedisProtocolError("MGET value count mismatch")
             observed_utc = utc_now()
             observed_ns = time.monotonic_ns()
             self.sequence += 1
-            for key, payload in zip(capture_keys, values):
+            for key, payload in items:
                 digest = hashlib.sha256(payload).hexdigest() if payload is not None else None
                 previous_known = key in self.previous_hash
                 changed = previous_known and self.previous_hash[key] != digest
@@ -1027,6 +1080,7 @@ class RedisWorker:
                     "observed_at_utc": observed_utc,
                     "monotonic_ns": observed_ns,
                     "round_trip_ms": round(round_trip_ms, 3),
+                    "read_method": read_mode,
                     "endpoint": endpoint,
                     "key": key,
                     "redis_type": key_types.get(key, "unknown"),
@@ -1269,7 +1323,7 @@ def _format_hex(hex_text, bytes_per_line=32):
 
 
 class SmartDriverApp:
-    def __init__(self, root):
+    def __init__(self, root, initial_config=None, output_root=None):
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
 
@@ -1284,6 +1338,15 @@ class SmartDriverApp:
         self.root.configure(background="#ffffff")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
+        initial_config = initial_config or {
+            "redis_host": "192.168.2.112",
+            "redis_port": 6379,
+            "redis_database": 0,
+            "udp_multicast": "239.255.76.21",
+            "udp_port": 7621,
+            "udp_interface": "auto",
+        }
+
         self.bus = UiEventBus()
         self.capture = CaptureSession()
         self.redis_worker = None
@@ -1292,18 +1355,20 @@ class SmartDriverApp:
         self.udp_events = collections.OrderedDict()
         self.counters = collections.Counter()
         self.inventory_count = 0
+        self.inventory_method = "等待"
+        self.redis_read_method = "等待"
         self._last_age_refresh = 0.0
         self._record_was_active = False
         self._last_capture_directory = None
 
-        self.redis_host = tk.StringVar(value="192.168.2.112")
-        self.redis_port = tk.StringVar(value="6379")
-        self.redis_db = tk.StringVar(value="0")
-        self.udp_group = tk.StringVar(value="239.255.76.21")
-        self.udp_port = tk.StringVar(value="7621")
-        self.udp_interface = tk.StringVar(value="auto")
+        self.redis_host = tk.StringVar(value=str(initial_config["redis_host"]))
+        self.redis_port = tk.StringVar(value=str(initial_config["redis_port"]))
+        self.redis_db = tk.StringVar(value=str(initial_config["redis_database"]))
+        self.udp_group = tk.StringVar(value=str(initial_config["udp_multicast"]))
+        self.udp_port = tk.StringVar(value=str(initial_config["udp_port"]))
+        self.udp_interface = tk.StringVar(value=str(initial_config["udp_interface"]))
         documents = Path.home() / "Documents"
-        self.output_root = tk.StringVar(value=str(documents / "SmartDriverCaptures"))
+        self.output_root = tk.StringVar(value=str(output_root or documents / "SmartDriverCaptures"))
         self.redis_status = tk.StringVar(value="未连接")
         self.udp_status = tk.StringVar(value="未监听")
         self.record_status = tk.StringVar(value="未录制")
@@ -1316,28 +1381,32 @@ class SmartDriverApp:
         self.root.after(100, self._process_events)
 
     def _configure_style(self):
+        from tkinter import font as tkfont
+
         style = self.ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except self.tk.TclError:
             pass
+        ui_family = tkfont.nametofont("TkDefaultFont").actual("family")
+        self.fixed_font_family = tkfont.nametofont("TkFixedFont").actual("family")
         style.configure("TFrame", background="#ffffff")
         style.configure("Surface.TFrame", background="#f4f5f8")
-        style.configure("TLabel", background="#ffffff", foreground="#172033", font=("Segoe UI", 10))
+        style.configure("TLabel", background="#ffffff", foreground="#172033", font=(ui_family, 10))
         style.configure("Muted.TLabel", foreground="#59657a")
-        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16), foreground="#172033")
-        style.configure("Status.TLabel", font=("Segoe UI Semibold", 10))
-        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 6))
+        style.configure("Title.TLabel", font=(ui_family, 16, "bold"), foreground="#172033")
+        style.configure("Status.TLabel", font=(ui_family, 10, "bold"))
+        style.configure("TButton", font=(ui_family, 10), padding=(10, 6))
         style.configure("Accent.TButton", background="#3449a5", foreground="#ffffff")
         style.map("Accent.TButton", background=[("active", "#293b8b"), ("pressed", "#203174")])
         style.configure("Stop.TButton", background="#b42335", foreground="#ffffff")
         style.map("Stop.TButton", background=[("active", "#92202f"), ("pressed", "#781a27")])
-        style.configure("Treeview", font=("Segoe UI", 9), rowheight=25, background="#ffffff",
+        style.configure("Treeview", font=(ui_family, 9), rowheight=25, background="#ffffff",
                         fieldbackground="#ffffff", foreground="#172033")
-        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), padding=(5, 5))
+        style.configure("Treeview.Heading", font=(ui_family, 9, "bold"), padding=(5, 5))
         style.map("Treeview", background=[("selected", "#dce3ff")], foreground=[("selected", "#172033")])
         style.configure("TNotebook", background="#ffffff", borderwidth=0)
-        style.configure("TNotebook.Tab", font=("Segoe UI", 10), padding=(16, 8))
+        style.configure("TNotebook.Tab", font=(ui_family, 10), padding=(16, 8))
         style.map("TNotebook.Tab", background=[("selected", "#ffffff")], foreground=[("selected", "#293b8b")])
 
     def _build_ui(self):
@@ -1535,7 +1604,7 @@ class SmartDriverApp:
         container = self.ttk.Frame(parent)
         container.pack(fill="both", expand=True, pady=(5, 0))
         text = self.tk.Text(
-            container, wrap="none", font=("Consolas", 9), background="#f7f8fa",
+            container, wrap="none", font=(self.fixed_font_family, 9), background="#f7f8fa",
             foreground="#172033", insertbackground="#172033", relief="flat", padx=8, pady=8)
         scroll_y = self.ttk.Scrollbar(container, orient="vertical", command=text.yview)
         scroll_x = self.ttk.Scrollbar(container, orient="horizontal", command=text.xview)
@@ -1664,7 +1733,12 @@ class SmartDriverApp:
             self.udp_status_detail = event.get("detail", "")
         elif event_type == "redis_inventory":
             self.inventory_count = len(event.get("keys", []))
+            self.inventory_method = {
+                "scan": "SCAN",
+                "configured": "固定 Unity 键",
+            }.get(event.get("discovery_method"), "未知")
         elif event_type == "redis_observation":
+            self.redis_read_method = event.get("read_method", "未知").upper()
             self._handle_redis(event)
         elif event_type == "udp_datagram":
             self._handle_udp(event)
@@ -1869,8 +1943,9 @@ class SmartDriverApp:
         record_state = "录制中" if self.capture.active else "未录制"
         self.overview_tree.item("redis", values=(
             "Redis", redis_state, self.counters["redis"],
-            "扫描键 %d，已知 Unity 键 %d，解析失败 %d" % (
-                self.inventory_count, len(UNITY_REDIS_KEYS), self.counters["redis_parse_error"])))
+            "键清单 %d（%s），读取 %s，已知 Unity 键 %d，解析失败 %d" % (
+                self.inventory_count, self.inventory_method, self.redis_read_method,
+                len(UNITY_REDIS_KEYS), self.counters["redis_parse_error"])))
         self.overview_tree.item("udp", values=(
             "UDP 7621", udp_state, self.counters["udp"],
             "解析失败 %d；所有 datagram 均保留" % self.counters["udp_parse_error"]))
@@ -2015,6 +2090,62 @@ def run_self_test():
     connection = RedisConnection("unused", 0, 0)
     connection.stream = io.BytesIO(b"*2\r\n$3\r\nabc\r\n$-1\r\n")
     assert connection._read_resp() == [b"abc", None]
+    connection.stream = io.BytesIO(b"-NOPERM command not allowed\r\n")
+    try:
+        connection._read_resp()
+        raise AssertionError("Redis command error was not raised")
+    except RedisCommandError as exc:
+        assert "NOPERM" in str(exc)
+
+    fallback_bus = UiEventBus()
+    fallback_worker = RedisWorker(fallback_bus, CaptureSession(), "unused", 0, 0, interval=0)
+
+    class GetOnlyRedis:
+        def __init__(self):
+            self.get_keys = []
+
+        @staticmethod
+        def scan_keys():
+            raise RedisCommandError("NOPERM SCAN is not allowed")
+
+        def command(self, name, *parts):
+            if name == "MGET":
+                raise RedisCommandError("NOPERM MGET is not allowed")
+            assert name == "GET" and len(parts) == 1
+            key = parts[0]
+            self.get_keys.append(key)
+            if len(self.get_keys) == len(UNITY_REDIS_KEYS):
+                fallback_worker.stop_event.set()
+            if key == "Sensor_Lanelist":
+                raise RedisCommandError("NOPERM this key is not allowed")
+            return None
+
+    get_only = GetOnlyRedis()
+    fallback_worker._poll(get_only, "unused:0/db0")
+    assert get_only.get_keys == list(UNITY_REDIS_KEYS)
+    fallback_events = []
+    while not fallback_bus.queue.empty():
+        fallback_events.append(fallback_bus.queue.get_nowait())
+    assert len([event for event in fallback_events if event["type"] == "redis_observation"]) == 5
+    assert any(event.get("discovery_method") == "configured" for event in fallback_events)
+    assert all(
+        event["read_method"] == "get"
+        for event in fallback_events if event["type"] == "redis_observation")
+    assert any("individual GET" in event.get("message", "") for event in fallback_events)
+
+    rejected_worker = RedisWorker(UiEventBus(), CaptureSession(), "unused", 0, 0, interval=0)
+
+    class RejectedMget(GetOnlyRedis):
+        def command(self, name, *parts):
+            if name == "MGET":
+                raise RedisCommandError("CROSSSLOT keys do not hash to the same slot")
+            raise AssertionError("ordinary MGET errors must not fall back to GET")
+
+    try:
+        rejected_worker._poll(RejectedMget(), "unused:0/db0")
+        raise AssertionError("ordinary MGET error was swallowed")
+    except RedisCommandError as exc:
+        assert "CROSSSLOT" in str(exc)
 
     with tempfile.TemporaryDirectory(prefix="smartdriver-live-test-") as temporary:
         config = validate_capture_config(
@@ -2110,10 +2241,30 @@ def main(argv=None):
     try:
         import tkinter as tk
     except ImportError as exc:
-        print("Tkinter is unavailable: %s; use --headless on this system" % exc, file=sys.stderr)
+        print(
+            "Tkinter is unavailable: %s. Install the system Python Tk package "
+            "(Ubuntu/Debian: python3-tk), or use --headless." % exc,
+            file=sys.stderr,
+        )
         return 2
-    root = tk.Tk()
-    SmartDriverApp(root)
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(
+            "GUI is unavailable: %s. Install Tk and start from a graphical desktop; "
+            "use --headless on a server." % exc,
+            file=sys.stderr,
+        )
+        return 2
+    initial_config = {
+        "redis_host": args.redis_host,
+        "redis_port": args.redis_port,
+        "redis_database": args.redis_database,
+        "udp_multicast": args.udp_group,
+        "udp_port": args.udp_port,
+        "udp_interface": args.udp_interface,
+    }
+    SmartDriverApp(root, initial_config, args.output_root)
     root.mainloop()
     return 0
 
