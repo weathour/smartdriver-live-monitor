@@ -10,7 +10,7 @@ SmartDriver Live Monitor 是一套 Redis 与 UDP 现场监看工具。Windows/Ub
 
 同一份 `smartdriver_monitor.py` 同时支持 Windows 与 Linux 图形界面，也支持两端的无界面录制。`android/` 是不额外引入 Redis、网络或 UI 库的原生 Kotlin 监视端，参考仓库现有安卓语音应用的裸 RESP 客户端与原生界面方式实现，但没有复制语音、TTS 或后台麦克风服务。
 
-当前版本：桌面端 `1.2`；Android 端 `1.0`
+当前版本：桌面端 `1.3`；Android 端 `1.0`
 
 ## 桌面端能录到什么
 
@@ -88,7 +88,7 @@ git clone https://github.com/weathour/smartdriver-live-monitor.git
 cd smartdriver-live-monitor
 ```
 
-Android 测试包也可从成功的 GitHub Actions 运行中下载 `smartdriver-monitor-android-debug` artifact。
+从 `v1.3.0` 起，Release 同时提供 Android 1.0 debug APK；也可从成功的 GitHub Actions 运行中下载 `smartdriver-monitor-android-debug` artifact。
 
 ## Windows 使用方法
 

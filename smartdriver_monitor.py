@@ -21,7 +21,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 DEFAULT_REDIS_HOST = "192.168.2.112"
 DEFAULT_REDIS_PORT = 6379
 DEFAULT_REDIS_DATABASE = 0
