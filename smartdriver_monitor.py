@@ -22,6 +22,14 @@ from pathlib import Path
 
 
 APP_VERSION = "1.2"
+DEFAULT_REDIS_HOST = "192.168.2.112"
+DEFAULT_REDIS_PORT = 6379
+DEFAULT_REDIS_DATABASE = 0
+DEFAULT_UDP_GROUP = "239.255.76.21"
+DEFAULT_UDP_PORT = 7621
+DEFAULT_UDP_INTERFACE = "auto"
+MAX_COLLABORATIVE_VEHICLES = 64
+MAX_TRAJECTORY_POINTS = 256
 UNITY_REDIS_KEYS = (
     "Sensor_Location",
     "Sensor_Mmobstacles",
@@ -376,16 +384,20 @@ def parse_udp_packet(data):
         if nsec < 0 or nsec >= 1_000_000_000:
             reader.issues.append("header.stamp.nsec is outside [0, 1000000000)")
         collaborative_count = reader.int32()
-        if collaborative_count < 0 or collaborative_count > reader.remaining // 8:
-            raise ParseError("collaborative vehicle count %d does not fit remaining bytes" % collaborative_count)
+        if (collaborative_count < 0
+                or collaborative_count > MAX_COLLABORATIVE_VEHICLES
+                or collaborative_count > max(0, (reader.remaining - 24) // 8)):
+            raise ParseError("collaborative vehicle count %d is outside protocol bounds" % collaborative_count)
         message["collaborative_vehicle_list_size"] = collaborative_count
         message["collaborative_vehicle_list"] = [
             {"vid": reader.int32(), "suggested_driving_behavior": reader.int32()}
             for _ in range(collaborative_count)
         ]
         trajectory_count = reader.int32()
-        if trajectory_count < 0 or trajectory_count > max(0, (reader.remaining - 20) // 141):
-            raise ParseError("trajectory point count %d does not fit remaining bytes" % trajectory_count)
+        if (trajectory_count < 0
+                or trajectory_count > MAX_TRAJECTORY_POINTS
+                or trajectory_count > max(0, (reader.remaining - 20) // 141)):
+            raise ParseError("trajectory point count %d is outside protocol bounds" % trajectory_count)
         message["intend_trajectory_points_size"] = trajectory_count
         message["intend_trajectory_points"] = [
             _trajectory_point(reader, index) for index in range(trajectory_count)
@@ -1339,12 +1351,12 @@ class SmartDriverApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         initial_config = initial_config or {
-            "redis_host": "192.168.2.112",
-            "redis_port": 6379,
-            "redis_database": 0,
-            "udp_multicast": "239.255.76.21",
-            "udp_port": 7621,
-            "udp_interface": "auto",
+            "redis_host": DEFAULT_REDIS_HOST,
+            "redis_port": DEFAULT_REDIS_PORT,
+            "redis_database": DEFAULT_REDIS_DATABASE,
+            "udp_multicast": DEFAULT_UDP_GROUP,
+            "udp_port": DEFAULT_UDP_PORT,
+            "udp_interface": DEFAULT_UDP_INTERFACE,
         }
 
         self.bus = UiEventBus()
@@ -1492,7 +1504,7 @@ class SmartDriverApp:
             self.overview_tree.column(key, width=width, stretch=stretch, anchor="w")
         self.overview_tree.pack(fill="x")
         self.overview_tree.insert("", "end", iid="redis", values=("Redis", "未连接", 0, ""))
-        self.overview_tree.insert("", "end", iid="udp", values=("UDP 7621", "未监听", 0, ""))
+        self.overview_tree.insert("", "end", iid="udp", values=("UDP", "未监听", 0, ""))
         self.overview_tree.insert("", "end", iid="record", values=("磁盘录制", "未录制", 0, ""))
 
         ttk.Label(frame, text="判读提示", style="Title.TLabel").pack(anchor="w", pady=(22, 8))
@@ -1947,7 +1959,7 @@ class SmartDriverApp:
                 self.inventory_count, self.inventory_method, self.redis_read_method,
                 len(UNITY_REDIS_KEYS), self.counters["redis_parse_error"])))
         self.overview_tree.item("udp", values=(
-            "UDP 7621", udp_state, self.counters["udp"],
+            "UDP " + self.udp_port.get(), udp_state, self.counters["udp"],
             "解析失败 %d；所有 datagram 均保留" % self.counters["udp_parse_error"]))
         self.overview_tree.item("record", values=(
             "磁盘录制", record_state,
@@ -2047,8 +2059,29 @@ def _fixed_test_string(value):
     return encoded + b"\0" * (32 - len(encoded))
 
 
+def _test_udp_payload():
+    return b"".join((
+        struct.pack("<iii", 7, 100, 200), _fixed_test_string("map"),
+        struct.pack("<i", 3), _fixed_test_string("渝A12345"), _fixed_test_string("L4"),
+        struct.pack("<ii", 1, 2),
+        struct.pack("<ddd", 0.1, 0.2, 10.0),
+        struct.pack("<ddd", 106.3, 29.5, 250.0),
+        struct.pack("<ddd", 1.0, 2.0, 3.0),
+        struct.pack("<ddd", 0.01, 0.02, 1.57),
+        struct.pack("<i", 1), struct.pack("<ii", 4, 5),
+        struct.pack("<i", 0),
+        struct.pack("<iiiii", 6, 7, 8, 9, 10),
+        b"\xaa\xbb\xcc",
+    ))
+
+
 def run_self_test():
     import io
+
+    assert (
+        DEFAULT_REDIS_HOST, DEFAULT_REDIS_PORT, DEFAULT_REDIS_DATABASE,
+        DEFAULT_UDP_GROUP, DEFAULT_UDP_PORT,
+    ) == ("192.168.2.112", 6379, 0, "239.255.76.21", 7621)
 
     light = b"".join((
         _protobuf_varint(1, 2),
@@ -2068,24 +2101,18 @@ def run_self_test():
     assert traffic["decoded"]["traffic_light_num"] == 1
     assert traffic["decoded"]["trafficlights"][0]["remaining_time"] == 12.5
 
-    udp_payload = b"".join((
-        struct.pack("<iii", 7, 100, 200), _fixed_test_string("map"),
-        struct.pack("<i", 3), _fixed_test_string("渝A12345"), _fixed_test_string("L4"),
-        struct.pack("<ii", 1, 2),
-        struct.pack("<ddd", 0.1, 0.2, 10.0),
-        struct.pack("<ddd", 106.3, 29.5, 250.0),
-        struct.pack("<ddd", 1.0, 2.0, 3.0),
-        struct.pack("<ddd", 0.01, 0.02, 1.57),
-        struct.pack("<i", 1), struct.pack("<ii", 4, 5),
-        struct.pack("<i", 0),
-        struct.pack("<iiiii", 6, 7, 8, 9, 10),
-        b"\xaa\xbb\xcc",
-    ))
+    udp_payload = _test_udp_payload()
     udp = parse_udp_packet(udp_payload)
     assert udp["status"] == "ok_with_trailing"
     assert udp["trailing_bytes"] == 3
     assert udp["decoded"]["vid"] == 3
     assert udp["decoded"]["collaborative_vehicle_list"][0]["vid"] == 4
+    too_many_vehicles = bytearray(udp_payload[:228] + bytes(64 * 8) + udp_payload[228:])
+    struct.pack_into("<i", too_many_vehicles, 216, 65)
+    assert parse_udp_packet(too_many_vehicles)["status"] == "parse_error"
+    too_many_points = bytearray(udp_payload[:232] + bytes(257 * 141) + udp_payload[232:])
+    struct.pack_into("<i", too_many_points, 228, 257)
+    assert parse_udp_packet(too_many_points)["status"] == "parse_error"
 
     connection = RedisConnection("unused", 0, 0)
     connection.stream = io.BytesIO(b"*2\r\n$3\r\nabc\r\n$-1\r\n")
@@ -2149,7 +2176,8 @@ def run_self_test():
 
     with tempfile.TemporaryDirectory(prefix="smartdriver-live-test-") as temporary:
         config = validate_capture_config(
-            "127.0.0.1", 6379, 0, "239.255.76.21", 7621, "auto")
+            "127.0.0.1", DEFAULT_REDIS_PORT, DEFAULT_REDIS_DATABASE,
+            DEFAULT_UDP_GROUP, DEFAULT_UDP_PORT, DEFAULT_UDP_INTERFACE)
         capture = CaptureSession()
         worker = RedisWorker(UiEventBus(), capture, "unused", 0, 0)
         inventory = {
@@ -2191,19 +2219,91 @@ def run_self_test():
     print("SELF_TEST=OK")
 
 
+def run_network_self_test():
+    redis_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    redis_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    redis_listener.bind(("127.0.0.1", 0))
+    redis_listener.listen(1)
+    redis_listener.settimeout(2.0)
+    redis_port = redis_listener.getsockname()[1]
+    redis_request = []
+    redis_server_errors = []
+
+    def serve_redis_once():
+        try:
+            with redis_listener:
+                client, _ = redis_listener.accept()
+                with client, client.makefile("rb") as stream:
+                    request_reader = RedisConnection("unused", 0, 0)
+                    request_reader.stream = stream
+                    redis_request.extend(request_reader._read_resp())
+                    reply = [b"*%d\r\n" % len(UNITY_REDIS_KEYS)]
+                    for value in (b"abc",) + (None,) * (len(UNITY_REDIS_KEYS) - 1):
+                        reply.append(b"$-1\r\n" if value is None else b"$%d\r\n%s\r\n" % (len(value), value))
+                    client.sendall(b"".join(reply))
+        except BaseException as exc:
+            redis_server_errors.append(exc)
+
+    redis_thread = threading.Thread(target=serve_redis_once, daemon=True)
+    redis_thread.start()
+    redis = RedisConnection("127.0.0.1", redis_port, 0, timeout=2.0)
+    try:
+        redis.connect()
+        redis_values = redis.command("MGET", *UNITY_REDIS_KEYS)
+    finally:
+        redis.close()
+    redis_thread.join(2.0)
+    assert not redis_thread.is_alive() and not redis_server_errors
+    assert redis_request == [b"MGET"] + [key.encode("utf-8") for key in UNITY_REDIS_KEYS]
+    assert redis_values == [b"abc"] + [None] * (len(UNITY_REDIS_KEYS) - 1)
+
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.bind(("127.0.0.1", 0))
+    udp_socket.settimeout(0.2)
+    udp_port = udp_socket.getsockname()[1]
+    udp_bus = UiEventBus()
+    udp_worker = UdpWorker(
+        udp_bus, CaptureSession(), DEFAULT_UDP_GROUP, udp_port, DEFAULT_UDP_INTERFACE)
+    udp_errors = []
+
+    def receive_udp():
+        try:
+            udp_worker._receive(udp_socket, "%s:%d" % (DEFAULT_UDP_GROUP, udp_port))
+        except BaseException as exc:
+            if not udp_worker.stop_event.is_set():
+                udp_errors.append(exc)
+
+    udp_thread = threading.Thread(target=receive_udp, daemon=True)
+    udp_thread.start()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(_test_udp_payload(), ("127.0.0.1", udp_port))
+        udp_event = udp_bus.queue.get(timeout=2.0)
+    finally:
+        udp_worker.stop_event.set()
+        udp_socket.close()
+        udp_thread.join(2.0)
+    assert not udp_thread.is_alive() and not udp_errors
+    assert udp_event["type"] == "udp_datagram" and udp_event["parse"]["decoded"]["vid"] == 3
+    print("NETWORK_SELF_TEST=OK")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--self-test", action="store_true", help="run parser/recorder checks without opening a GUI")
+    mode.add_argument(
+        "--network-self-test", action="store_true",
+        help="run loopback Redis/UDP socket checks without contacting field systems")
     mode.add_argument("--headless", action="store_true", help="record without Tk; works on Linux and Windows")
     mode.add_argument("--verify-capture", metavar="DIR", help="verify a completed capture directory")
     mode.add_argument("--pack-capture", metavar="DIR", help="verify and create a transferable ZIP")
-    parser.add_argument("--redis-host", default="192.168.2.112")
-    parser.add_argument("--redis-port", default=6379, type=int)
-    parser.add_argument("--redis-database", default=0, type=int)
-    parser.add_argument("--udp-group", default="239.255.76.21")
-    parser.add_argument("--udp-port", default=7621, type=int)
-    parser.add_argument("--udp-interface", default="auto")
+    parser.add_argument("--redis-host", default=DEFAULT_REDIS_HOST)
+    parser.add_argument("--redis-port", default=DEFAULT_REDIS_PORT, type=int)
+    parser.add_argument("--redis-database", default=DEFAULT_REDIS_DATABASE, type=int)
+    parser.add_argument("--udp-group", default=DEFAULT_UDP_GROUP)
+    parser.add_argument("--udp-port", default=DEFAULT_UDP_PORT, type=int)
+    parser.add_argument("--udp-interface", default=DEFAULT_UDP_INTERFACE)
     parser.add_argument(
         "--output-root", default=str(Path.home() / "Documents" / "SmartDriverCaptures"))
     parser.add_argument(
@@ -2213,6 +2313,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.self_test:
         run_self_test()
+        return 0
+    if args.network_self_test:
+        run_network_self_test()
         return 0
     if args.archive and not args.headless:
         parser.error("--archive requires --headless")

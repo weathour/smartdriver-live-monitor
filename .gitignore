@@ -5,3 +5,7 @@ SmartDriverLiveCapture-*/
 *.zip
 *.zip.sha256
 graphify-out/
+android/.gradle/
+android/local.properties
+android/build/
+android/app/build/

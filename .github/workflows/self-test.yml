@@ -26,7 +26,27 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb xauth fonts-noto-cjk
       - run: python smartdriver_monitor.py --self-test
+      - run: python smartdriver_monitor.py --network-self-test
       - if: runner.os == 'Linux'
         run: xvfb-run -a -s "-screen 0 1600x1000x24" python -c "import tkinter as tk; import smartdriver_monitor as m; root=tk.Tk(); app=m.SmartDriverApp(root); root.update_idletasks(); assert root.winfo_exists(); app.close(); print('GUI_SMOKE_TEST=OK')"
       - if: runner.os == 'Windows'
         run: python -c "import tkinter as tk; import smartdriver_monitor as m; root=tk.Tk(); app=m.SmartDriverApp(root); root.update_idletasks(); assert root.winfo_exists(); app.close(); print('GUI_SMOKE_TEST=OK')"
+
+  android:
+    name: Android / API 26+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v6
+      - working-directory: android
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+      - uses: actions/upload-artifact@v7
+        with:
+          name: smartdriver-monitor-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

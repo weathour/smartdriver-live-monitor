@@ -2,17 +2,17 @@
 
 [![Cross-platform self-test](https://github.com/weathour/smartdriver-live-monitor/actions/workflows/self-test.yml/badge.svg)](https://github.com/weathour/smartdriver-live-monitor/actions/workflows/self-test.yml)
 
-SmartDriver Live Monitor 是一套不依赖第三方 Python 包的 Redis 与 UDP 现场监看、录制和校验工具。它用于回答三个具体问题：
+SmartDriver Live Monitor 是一套 Redis 与 UDP 现场监看工具。Windows/Ubuntu 桌面端还负责录制与校验；Android 端只负责前台实时监视。它用于回答三个具体问题：
 
 1. Unity 依赖的 Redis 键当前是否存在，内容是否更新，能否按已知格式解析。
-2. Python 应用是否收到了指定组播地址上的 UDP 数据报，是否有重复、乱序或尾随字节。
-3. 一次录制能否完整停止、校验并打包成便于机器读取和跨电脑转移的文件。
+2. 当前接收端是否收到了指定组播地址上的 UDP 数据报，是否有重复、乱序或尾随字节。
+3. 桌面端的一次录制能否完整停止、校验并打包成便于机器读取和跨电脑转移的文件。
 
-同一份 `smartdriver_monitor.py` 同时支持 Windows 与 Linux 图形界面，也支持两端的无界面录制。核心接收和录制逻辑不分叉。
+同一份 `smartdriver_monitor.py` 同时支持 Windows 与 Linux 图形界面，也支持两端的无界面录制。`android/` 是不额外引入 Redis、网络或 UI 库的原生 Kotlin 监视端，参考仓库现有安卓语音应用的裸 RESP 客户端与原生界面方式实现，但没有复制语音、TTS 或后台麦克风服务。
 
-当前版本：`1.2`
+当前版本：桌面端 `1.2`；Android 端 `1.0`
 
-## 能录到什么
+## 桌面端能录到什么
 
 ### Redis
 
@@ -61,7 +61,8 @@ Redis 兼容策略以 Unity 的实际读取权限为下限：DB 0 不发送 `SEL
 - 工具能证明某条数据已经到达 Python 应用。
 - 工具不能证明网卡或内核曾收到但没有交给 Python 的数据包。
 - Redis 是 100 ms 轮询快照，不是 Redis 服务端推送事件。
-- 图形界面只保留最近 500 条显示记录，磁盘录制不受这个显示上限影响。
+- 桌面图形界面只保留最近 500 条显示记录，磁盘录制不受这个显示上限影响。
+- Android 界面只保留最近 50 个 UDP datagram，不把监视载荷写入磁盘；事件过快时会明确显示 UI 丢弃数。
 
 如果 UDP 计数为零，需要结合 Windows `pktmon`、Wireshark 或 Linux `tcpdump` 检查网卡、组播路由和防火墙。不要把零计数直接解释成发送端没有发包。
 
@@ -73,8 +74,10 @@ Redis 兼容策略以 Unity 的实际读取权限为下限：DB 0 不发送 `SEL
 - Windows 图形界面需要 Python 自带的 Tcl/Tk
 - Linux 图形界面需要图形桌面、Tkinter 和可显示中文的系统字体
 - Linux 服务器可以使用无界面模式，不需要桌面环境或 Tcl/Tk
+- Android 8.0（API 26）或更高版本；手机需与 Redis/UDP 发送端网络可达
+- 构建 Android APK 需要 JDK 17 和 Android SDK 35；已安装 APK 不需要 Python
 
-项目的持续集成会在 Windows 和 Ubuntu 上分别使用 Python 3.10 与 3.12 运行同一套离线自检，并实际创建一次 Tk 窗口。Ubuntu 的窗口检查运行在虚拟显示器中。
+项目的持续集成会在 Windows 和 Ubuntu 上分别使用 Python 3.10 与 3.12 运行解析、录制与本机 TCP/UDP socket 自检，并实际创建一次 Tk 窗口；Android job 会运行单元测试、lint、构建 APK 并上传 artifact。
 
 ## 下载
 
@@ -84,6 +87,8 @@ Redis 兼容策略以 Unity 的实际读取权限为下限：DB 0 不发送 `SEL
 git clone https://github.com/weathour/smartdriver-live-monitor.git
 cd smartdriver-live-monitor
 ```
+
+Android 测试包也可从成功的 GitHub Actions 运行中下载 `smartdriver-monitor-android-debug` artifact。
 
 ## Windows 使用方法
 
@@ -174,6 +179,29 @@ python3 smartdriver_monitor.py --headless --udp-interface 192.168.2.50
 
 也可以用逗号指定多个地址。`auto` 会尝试通配地址和工具发现的本机 IPv4 地址。
 
+## Android 使用方法
+
+Android 端在应用可见时每 100 ms 读取六个固定 Unity Redis 键，并直接加入 `239.255.76.21:7621` 组播。界面显示连接状态、观察与变化计数、内容未变化时长、解析摘要、SHA-256、UDP 重复/乱序/尾随标签；点击 Redis 或 UDP 条目可查看解析详情和原始十六进制。
+
+构建并运行单元检查：
+
+```bash
+cd android
+./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+Windows 使用 `gradlew.bat`。生成的 APK 位于：
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+安装后填写 Redis、UDP 和可选网卡 IPv4，点击“应用并重连”。`auto` 会尝试手机当前可用的 IPv4 网卡；多网络设备收不到组播时，填写 Wi-Fi 网卡的具体 IPv4。
+
+Android 端没有录制按钮、监视数据文件、后台服务、Redis `SCAN`、Redis 密码/TLS 或 Redis Cluster 支持；只在本机保存连接设置。切到后台时会立即关闭 Redis/UDP 套接字并释放组播锁。完整说明见 [Android 监视端说明](android/README.md)。
+
+三类设备的统一准备、执行、通过标准和故障定位见 [现场测试清单](docs/FIELD_TEST.md)。
+
 ## 录制前检查
 
 先做一次 10 秒短录制：
@@ -207,6 +235,7 @@ VERIFY_CAPTURE=OK
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `--self-test` | 无 | 离线检查解析器、录制器、校验器和打包器 |
+| `--network-self-test` | 无 | 用本机临时端口检查真实 Redis TCP/RESP 与 UDP socket 读取链路 |
 | `--headless` | 无 | 不启动 Tk，适用于 Windows 和 Linux |
 | `--redis-host` | `192.168.2.112` | Redis 地址；也作为图形界面的初始值 |
 | `--redis-port` | `6379` | Redis 端口 |
@@ -267,6 +296,8 @@ ZIP 内保留顶层录制目录，便于解压多个批次而不互相覆盖。�
 
 先确认发送端地址和端口，再尝试用 `--udp-interface` 指定有线网卡的 IPv4 地址。继续为零时，用系统级抓包工具判断数据是否到达网卡。虚拟网卡、VPN、防火墙和组播路由都会影响接收。
 
+Android 上还需确认手机使用 Wi-Fi 而非蜂窝网络、路由器/AP 没有启用客户端隔离，并尝试在应用中填写 Wi-Fi 网卡的具体 IPv4。应用会申请 Wi-Fi 组播锁，但系统或 AP 仍可能过滤组播。
+
 ### Linux 报告 Tkinter 不可用
 
 Ubuntu/Debian 安装 `python3-tk fonts-noto-cjk`，并从图形桌面运行。如果机器没有显示服务（例如纯 SSH 服务器），使用 `--headless`；无界面录制不依赖 Tk。
@@ -286,6 +317,7 @@ Ubuntu/Debian 安装 `python3-tk fonts-noto-cjk`，并从图形桌面运行。�
 - 磁盘时间线与界面显示相互独立。
 - Windows 和 Linux 共用同一个图形界面与录制核心。
 - 仅使用 Python 标准库，降低现场安装风险。
+- Android 端只执行只读 Redis 命令并接收 UDP，不录制也不在后台持续运行。
 - 状态文案区分已验证事实和需要系统级工具确认的边界。
 - 格式变化必须更新版本、校验器和格式文档。
 
