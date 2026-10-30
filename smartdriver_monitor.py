@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import queue
+import select
 import socket
 import struct
 import sys
@@ -692,6 +693,7 @@ class RedisConnection:
         self.timeout = timeout
         self.sock = None
         self.stream = None
+        self.cancel_event = None
 
     def connect(self):
         self.sock = socket.create_connection((self.host, self.port), self.timeout)
@@ -723,17 +725,34 @@ class RedisConnection:
         return self._read_resp()
 
     def _read_line(self):
-        line = self.stream.readline()
-        if not line:
-            raise RedisProtocolError("Redis connection closed")
+        line = bytearray()
+        while not line.endswith(b"\n"):
+            line.extend(self._read_exact(1))
         if not line.endswith(b"\r\n"):
             raise RedisProtocolError("invalid RESP line ending")
-        return line[:-2]
+        return bytes(line[:-2])
+
+    def _wait_readable(self):
+        if self.sock is None:
+            return  # In-memory protocol fixtures do not need socket readiness.
+        deadline = time.monotonic() + self.timeout
+        while True:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise RedisProtocolError("Redis read cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("Redis read timed out")
+            # Windows does not always wake a pending socket-file read when a
+            # different thread calls shutdown. Bound readiness waits explicitly.
+            ready, _, _ = select.select([self.sock], [], [], min(0.1, remaining))
+            if ready:
+                return
 
     def _read_exact(self, length):
         chunks = []
         remaining = length
         while remaining:
+            self._wait_readable()
             chunk = self.stream.read(remaining)
             if not chunk:
                 raise RedisProtocolError("Redis bulk value truncated")
@@ -1057,6 +1076,7 @@ class RedisWorker:
         endpoint = "%s:%d/db%d" % (self.host, self.port, self.database)
         while not self.stop_event.is_set():
             connection = RedisConnection(self.host, self.port, self.database)
+            connection.cancel_event = self.stop_event
             self.connection = connection
             try:
                 self.bus.publish({"type": "redis_status", "status": "connecting", "detail": endpoint})

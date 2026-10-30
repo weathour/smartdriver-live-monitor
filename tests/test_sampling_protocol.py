@@ -3,6 +3,7 @@ import json
 import socket
 import struct
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -78,7 +79,8 @@ class SamplingTests(unittest.TestCase):
         client.settimeout(10)
         server.settimeout(2)
         connection = m.RedisConnection("unused", 0, 0)
-        connection.sock = client
+        connection.sock = mock.Mock(wraps=client)
+        connection.sock.shutdown.side_effect = OSError("shutdown did not wake the read")
         connection.stream = client.makefile("rwb", buffering=0)
         worker = m.RedisWorker(m.UiEventBus(), m.CaptureSession(), "unused", 0, 0)
         try:
@@ -92,6 +94,39 @@ class SamplingTests(unittest.TestCase):
         finally:
             worker.stop_event.set()
             server.close()
+            connection.close()
+
+    def test_stop_interrupts_partial_resp_header_without_waiting_for_newline(self):
+        client, server = socket.socketpair()
+        client.settimeout(10)
+        server.settimeout(2)
+        connection = m.RedisConnection("unused", 0, 0, timeout=10)
+        connection.sock = mock.Mock(wraps=client)
+        connection.sock.shutdown.side_effect = OSError("shutdown did not wake the read")
+        connection.stream = client.makefile("rwb", buffering=0)
+        worker = m.RedisWorker(m.UiEventBus(), m.CaptureSession(), "unused", 0, 0)
+        reading_header = threading.Event()
+        original = connection._read_line
+
+        def read_header():
+            reading_header.set()
+            return original()
+
+        try:
+            with mock.patch.object(m, "RedisConnection", return_value=connection), \
+                    mock.patch.object(connection, "connect"), \
+                    mock.patch.object(connection, "_read_line", side_effect=read_header):
+                worker.start()
+                self.assertTrue(server.recv(4096))
+                server.sendall(b"+incomplete")
+                self.assertTrue(reading_header.wait(2))
+                started = time.monotonic()
+                self.assertTrue(worker.stop())
+                self.assertLess(time.monotonic() - started, 2)
+        finally:
+            worker.stop_event.set()
+            server.close()
+            worker.thread.join(2)
             connection.close()
 
 

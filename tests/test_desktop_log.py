@@ -1,5 +1,6 @@
 """Single-file format regressions; SQLite, synthetic bytes and no network."""
 import concurrent.futures
+from contextlib import closing, contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -30,9 +31,32 @@ class DesktopLogTests(unittest.TestCase):
         values.update(metadata)
         return self.session.observe(kind, payload, values, lambda: {"status": "ok", "decoded": {"value": 3}})
 
+    @contextmanager
+    def transaction(self):
+        # Connection.__exit__ commits/rolls back but does not close the handle.
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                yield connection
+
     def sql(self, query, parameters=()):
-        with sqlite3.connect(self.path) as connection:
+        with self.transaction() as connection:
             return connection.execute(query, parameters).fetchall()
+
+    def test_transaction_commits_and_explicitly_closes_real_connection(self):
+        self.session.stop()
+        with self.transaction() as connection:
+            connection.execute("CREATE TABLE lifecycle_check (value INTEGER)")
+            connection.execute("INSERT INTO lifecycle_check VALUES(42)")
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
+            connection.execute("SELECT 1")
+        self.assertEqual(self.sql("SELECT value FROM lifecycle_check"), [(42,)])
+        with self.assertRaisesRegex(RuntimeError, "rollback probe"):
+            with self.transaction() as failed_connection:
+                failed_connection.execute("INSERT INTO lifecycle_check VALUES(99)")
+                raise RuntimeError("rollback probe")
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
+            failed_connection.execute("SELECT 1")
+        self.assertEqual(self.sql("SELECT value FROM lifecycle_check"), [(42,)])
 
     def test_content_dedup_retains_each_observation_and_one_completed_file(self):
         for kind in ("udp", "udp", "redis"):
@@ -224,7 +248,7 @@ class DesktopLogTests(unittest.TestCase):
     def test_length_counts_and_reference_corruption_are_detected(self):
         self.observe(b"payload")
         self.session.stop()
-        with sqlite3.connect(self.path) as connection:
+        with self.transaction() as connection:
             original_manifest = connection.execute("SELECT json FROM manifest").fetchone()[0]
             manifest = json.loads(original_manifest)
             manifest["counts"]["udp"] = 0
