@@ -27,10 +27,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb xauth fonts-noto-cjk
       - run: python smartdriver_monitor.py --self-test
       - run: python smartdriver_monitor.py --network-self-test
+      - run: python -m unittest discover -s tests -v
+      - run: python -m py_compile smartdriver_monitor.py desktop_log.py udp_latest.py log_viewer.py
       - if: runner.os == 'Linux'
-        run: xvfb-run -a -s "-screen 0 1600x1000x24" python -c "import tkinter as tk; import smartdriver_monitor as m; root=tk.Tk(); app=m.SmartDriverApp(root); root.update_idletasks(); assert root.winfo_exists(); app.close(); print('GUI_SMOKE_TEST=OK')"
+        run: xvfb-run -a -s "-screen 0 1600x1000x24" python tests/gui_smoke.py
       - if: runner.os == 'Windows'
-        run: python -c "import tkinter as tk; import smartdriver_monitor as m; root=tk.Tk(); app=m.SmartDriverApp(root); root.update_idletasks(); assert root.winfo_exists(); app.close(); print('GUI_SMOKE_TEST=OK')"
+        run: python tests/gui_smoke.py
 
   android:
     name: Android / API 26+

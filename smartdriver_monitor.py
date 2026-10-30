@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SmartDriver Redis/UDP live monitor and lossless recorder (stdlib only)."""
+"""SmartDriver Redis/UDP latest-state monitor and 1 Hz recorder (stdlib only)."""
 
 import argparse
 import collections
@@ -18,10 +18,14 @@ import tempfile
 import threading
 import time
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 
+from desktop_log import DesktopCaptureSession, verify_log, pack_log
+from udp_latest import UdpLatestSampler
 
-APP_VERSION = "1.3"
+APP_VERSION = "1.5"
+REDIS_INTERVAL_SECONDS = 1.0
 DEFAULT_REDIS_HOST = "192.168.2.112"
 DEFAULT_REDIS_PORT = 6379
 DEFAULT_REDIS_DATABASE = 0
@@ -357,7 +361,58 @@ def _trajectory_point(reader, index):
     }
 
 
+def parse_lcm_envelope(data):
+    """Inspect LCM transport only; never infer a business schema from its bytes.
+
+    Wire layout: https://lcm-proj.github.io/lcm/content/udp-multicast-protocol.html
+    Fragment reassembly and generated-type decoding are deliberately separate.
+    """
+    try:
+        fragmented = data.startswith(b"LC03")
+        header_size = 20 if fragmented else 8
+        if len(data) < header_size:
+            raise ParseError("truncated LCM transport header")
+        transport = {"protocol": "lcm", "sequence": struct.unpack_from(">I", data, 4)[0]}
+        offset = header_size
+        if fragmented:
+            size, fragment_offset, number, count = struct.unpack_from(">IIHH", data, 8)
+            if not count or number >= count:
+                raise ParseError("invalid LCM fragment number/count")
+            if number == 0 and fragment_offset != 0:
+                raise ParseError("first LCM fragment has nonzero offset")
+            transport.update(payload_size=size, fragment_offset=fragment_offset,
+                             fragment_number=number, fragment_count=count)
+        if not fragmented or number == 0:
+            end = data.find(b"\0", offset)
+            if end < 0:
+                raise ParseError("LCM channel has no NUL terminator")
+            transport["channel"] = data[offset:end].decode("utf-8")
+            offset = end + 1
+        payload_size = len(data) - offset
+        transport["datagram_payload_bytes"] = payload_size
+        if fragmented:
+            if fragment_offset + payload_size > size:
+                raise ParseError("LCM fragment exceeds declared payload size")
+            transport["reassembled"] = False
+        elif payload_size >= 8:
+            # Only a candidate: LCM also allows application-defined raw payloads.
+            transport["type_fingerprint_candidate_hex"] = data[offset:offset + 8].hex()
+        return {
+            "status": "lcm_fragment" if fragmented else "lcm_unparsed",
+            "decoded": None,
+            "transport": transport,
+            "schema_verified": False,
+            "consumed_bytes": len(data),
+            "trailing_bytes": 0,
+        }
+    except (ValueError, struct.error) as exc:
+        return {"status": "parse_error", "protocol": "lcm", "decoded": None,
+                "error": str(exc), "consumed_bytes": 0, "trailing_bytes": 0}
+
+
 def parse_udp_packet(data):
+    if data.startswith((b"LC02", b"LC03")):
+        return parse_lcm_envelope(data)
     reader = BinaryReader(data)
     try:
         message = {
@@ -484,7 +539,7 @@ def validate_capture_config(redis_host, redis_port, redis_database, udp_group, u
         "redis_host": host,
         "redis_port": redis_port,
         "redis_database": database,
-        "redis_interval_ms": 100,
+        "redis_interval_ms": int(REDIS_INTERVAL_SECONDS * 1000),
         "udp_multicast": str(group_address),
         "udp_port": udp_port,
         "udp_interface": interface,
@@ -502,7 +557,7 @@ def _sha256_file(path):
 def _capture_files(directory):
     return sorted(
         (path for path in directory.rglob("*")
-         if path.is_file() and path.name not in ("SHA256SUMS", "SHA256SUMS.tmp")),
+         if path.is_file() and path != directory / "SHA256SUMS"),
         key=lambda path: path.relative_to(directory).as_posix(),
     )
 
@@ -513,13 +568,23 @@ def write_capture_checksums(directory):
         "%s  %s" % (_sha256_file(path), path.relative_to(directory).as_posix())
         for path in _capture_files(directory)
     ]
-    temporary = directory / "SHA256SUMS.tmp"
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(str(temporary), str(directory / "SHA256SUMS"))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=".SHA256SUMS-", suffix=".tmp",
+                dir=str(directory), delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write("\n".join(lines) + "\n")
+        os.replace(str(temporary), str(directory / "SHA256SUMS"))
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def verify_capture(directory):
     directory = Path(directory).expanduser().resolve()
+    if directory.is_file():
+        return verify_log(directory)
     checksum_path = directory / "SHA256SUMS"
     if not checksum_path.is_file():
         raise ValueError("missing SHA256SUMS: " + str(directory))
@@ -549,8 +614,9 @@ def verify_capture(directory):
             raise ValueError("checksum mismatch: " + relative)
 
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("format_version") != 2 or manifest.get("status") != "complete":
-        raise ValueError("capture manifest is not a complete format-version 2 recording")
+    if (manifest.get("format_version") not in (2, 3)
+            or manifest.get("status") != "complete" or manifest.get("last_error") is not None):
+        raise ValueError("capture manifest is not a complete, error-free format-version 2 or 3 recording")
     observed_counts = {}
     for name, count_key, payload_kind in (
         ("redis-observations.jsonl", "redis", "redis"),
@@ -586,6 +652,8 @@ def verify_capture(directory):
 
 def pack_capture(directory):
     directory = Path(directory).expanduser().resolve()
+    if directory.is_file():
+        return pack_log(directory)
     verify_capture(directory)
     archive = directory.parent / (directory.name + ".zip")
     sidecar = archive.with_name(archive.name + ".sha256")
@@ -597,9 +665,9 @@ def pack_capture(directory):
     temporary.close()
     try:
         with zipfile.ZipFile(str(temporary_path), "w", zipfile.ZIP_DEFLATED, allowZip64=True) as bundle:
-            for path in sorted(directory.rglob("*")):
-                if path.is_file():
-                    bundle.write(str(path), (Path(directory.name) / path.relative_to(directory)).as_posix())
+            for path in _capture_files(directory) + [directory / "SHA256SUMS"]:
+                bundle.write(str(path), (Path(directory.name) / path.relative_to(directory)).as_posix())
+        verify_capture(directory)
         os.replace(str(temporary_path), str(archive))
     finally:
         if temporary_path.exists():
@@ -651,7 +719,7 @@ class RedisConnection:
         request = [b"*%d\r\n" % len(encoded)]
         for part in encoded:
             request.extend((b"$%d\r\n" % len(part), part, b"\r\n"))
-        self.stream.write(b"".join(request))
+        self.sock.sendall(b"".join(request))
         return self._read_resp()
 
     def _read_line(self):
@@ -730,38 +798,45 @@ class CaptureSession:
             root.mkdir(parents=True, exist_ok=True)
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
             directory = root / ("SmartDriverLiveCapture-" + stamp)
-            (directory / "payloads" / "redis").mkdir(parents=True)
-            (directory / "payloads" / "udp").mkdir(parents=True)
-            self.handles = {
-                "redis": (directory / "redis-observations.jsonl").open("a", encoding="utf-8", buffering=1),
-                "udp": (directory / "udp-observations.jsonl").open("a", encoding="utf-8", buffering=1),
-                "inventory": (directory / "redis-inventory.jsonl").open("a", encoding="utf-8", buffering=1),
-                "events": (directory / "events.jsonl").open("a", encoding="utf-8", buffering=1),
-            }
+            directory.mkdir()
             self.directory = directory
+            self.handles = {}
             self.counts.clear()
             self.started_at = utc_now()
             self.config = dict(config)
             self.last_error = None
-            self.generation += 1
-            self.active = True
-            self._write_manifest_locked(None, "recording")
-            self._log_locked("INFO", "recording started")
+            try:
+                (directory / "payloads" / "redis").mkdir(parents=True)
+                (directory / "payloads" / "udp").mkdir(parents=True)
+                for kind, filename in (
+                        ("redis", "redis-observations.jsonl"), ("udp", "udp-observations.jsonl"),
+                        ("inventory", "redis-inventory.jsonl"), ("events", "events.jsonl")):
+                    self.handles[kind] = (directory / filename).open("a", encoding="utf-8", buffering=1)
+                self.generation += 1
+                self.active = True
+                self._write_manifest_locked(None, "recording")
+                self._log_locked("INFO", "recording started")
+            except Exception as exc:
+                self.last_error = "recording start failed: %s" % exc
+                self._abort_locked()
+                raise RuntimeError(self.last_error) from exc
             return directory
 
     def stop(self):
         with self.lock:
             if not self.active:
                 return self.directory
-            self._log_locked("INFO", "recording stopped")
-            self.active = False
             ended_at = utc_now()
             try:
+                self._log_locked("INFO", "recording stopped")
+                self.active = False
                 self._close_handles_locked()
                 self._write_manifest_locked(ended_at, "complete")
                 write_capture_checksums(self.directory)
             except Exception as exc:
                 self.last_error = "recording finalization failed: %s" % exc
+                self.active = False
+                self._close_handles_locked(ignore_errors=True)
                 try:
                     self._write_manifest_locked(ended_at, "failed")
                     write_capture_checksums(self.directory)
@@ -846,7 +921,7 @@ class CaptureSession:
 
     def _write_manifest_locked(self, ended_at, status):
         manifest = {
-            "format_version": 2,
+            "format_version": 3,
             "recorder": "SmartDriverLiveMonitor",
             "recorder_version": APP_VERSION,
             "status": status,
@@ -888,9 +963,13 @@ class CaptureSession:
         for handle in self.handles.values():
             try:
                 handle.flush()
-                handle.close()
             except Exception as exc:
                 first_error = first_error or exc
+            finally:
+                try:
+                    handle.close()
+                except Exception as exc:
+                    first_error = first_error or exc
         self.handles = {}
         if first_error is not None and not ignore_errors:
             raise first_error
@@ -906,7 +985,7 @@ class CaptureSession:
 
 
 class UiEventBus:
-    def __init__(self, maximum=5000):
+    def __init__(self, maximum=512):
         self.queue = queue.Queue(maxsize=maximum)
         self.dropped = 0
 
@@ -929,7 +1008,7 @@ class UiEventBus:
 
 
 class RedisWorker:
-    def __init__(self, bus, capture, host, port, database, interval=0.1, scan_interval=5.0):
+    def __init__(self, bus, capture, host, port, database, interval=REDIS_INTERVAL_SECONDS, scan_interval=5.0):
         self.bus = bus
         self.capture = capture
         self.host = host
@@ -943,13 +1022,22 @@ class RedisWorker:
         self.previous_hash = {}
         self.last_inventory_signature = None
         self.last_inventory_generation = 0
+        self.connection = None
 
     def start(self):
         self.thread.start()
 
     def stop(self):
         self.stop_event.set()
+        connection = self.connection
+        sock = connection.sock if connection else None
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         self.thread.join(timeout=3.0)
+        return not self.thread.is_alive()
 
     def _publish_log(self, level, message):
         self.capture.log(level, message)
@@ -969,6 +1057,7 @@ class RedisWorker:
         endpoint = "%s:%d/db%d" % (self.host, self.port, self.database)
         while not self.stop_event.is_set():
             connection = RedisConnection(self.host, self.port, self.database)
+            self.connection = connection
             try:
                 self.bus.publish({"type": "redis_status", "status": "connecting", "detail": endpoint})
                 connection.connect()
@@ -983,7 +1072,38 @@ class RedisWorker:
                     self.stop_event.wait(2.0)
             finally:
                 connection.close()
+                self.connection = None
         self.bus.publish({"type": "redis_status", "status": "stopped", "detail": endpoint})
+
+    def _observe_value(self, key, payload, endpoint, key_types, read_mode, request_started,
+                       observed_utc=None, observed_ns=None, round_trip_ms=None):
+        observed_utc = observed_utc or utc_now()
+        observed_ns = observed_ns if observed_ns is not None else time.monotonic_ns()
+        if round_trip_ms is None:
+            round_trip_ms = (time.perf_counter() - request_started) * 1000.0
+        digest = hashlib.sha256(payload).hexdigest() if payload is not None else None
+        changed = key in self.previous_hash and self.previous_hash[key] != digest
+        self.previous_hash[key] = digest
+        metadata = {
+            "kind": "redis_observation", "sequence": self.sequence,
+            "observed_at_utc": observed_utc, "monotonic_ns": observed_ns,
+            "round_trip_ms": round(round_trip_ms, 3), "read_method": read_mode,
+            "endpoint": endpoint, "key": key,
+            "redis_type": key_types.get(key, "unknown"),
+            "present": payload is not None, "changed": changed,
+            "length": len(payload) if payload is not None else 0, "sha256": digest,
+        }
+        parsed, capture_error = self.capture.observe(
+            "redis", payload, metadata,
+            lambda: decode_redis_payload(key, payload),
+        )
+        event = dict(metadata)
+        event.update(type="redis_observation", parse=parsed,
+                     raw_hex=payload[:2048].hex() if payload is not None else "",
+                     raw_preview_truncated=payload is not None and len(payload) > 2048)
+        self.bus.publish(event)
+        if capture_error:
+            self._publish_log("ERROR", capture_error)
 
     def _poll(self, connection, endpoint):
         capture_keys = list(UNITY_REDIS_KEYS)
@@ -1005,6 +1125,8 @@ class RedisWorker:
                     new_capture_keys = []
                     new_key_types = {}
                     for key in candidates:
+                        if self.stop_event.is_set():
+                            return
                         key_type = connection.command("TYPE", key)
                         new_inventory.append({
                             "key": key,
@@ -1048,8 +1170,8 @@ class RedisWorker:
             if inventory_event is not None:
                 self._record_inventory(inventory_event, inventory_signature)
 
+            self.sequence += 1
             request_started = time.perf_counter()
-            items = []
             if read_mode == "mget" and capture_keys:
                 try:
                     values = connection.command("MGET", *capture_keys)
@@ -1063,9 +1185,17 @@ class RedisWorker:
                 else:
                     if not isinstance(values, list) or len(values) != len(capture_keys):
                         raise RedisProtocolError("MGET value count mismatch")
-                    items = list(zip(capture_keys, values))
+                    observed_utc = utc_now()
+                    observed_ns = time.monotonic_ns()
+                    round_trip_ms = (time.perf_counter() - request_started) * 1000.0
+                    for key, payload in zip(capture_keys, values):
+                        self._observe_value(key, payload, endpoint, key_types, read_mode,
+                                            request_started, observed_utc, observed_ns, round_trip_ms)
             if read_mode == "get":
                 for key in capture_keys:
+                    if self.stop_event.is_set():
+                        return
+                    request_started = time.perf_counter()
                     try:
                         payload = connection.command("GET", key)
                     except RedisCommandError as exc:
@@ -1076,44 +1206,8 @@ class RedisWorker:
                             reported_get_errors[key] = error_state
                         continue
                     reported_get_errors.pop(key, None)
-                    items.append((key, payload))
-            round_trip_ms = (time.perf_counter() - request_started) * 1000.0
-            observed_utc = utc_now()
-            observed_ns = time.monotonic_ns()
-            self.sequence += 1
-            for key, payload in items:
-                digest = hashlib.sha256(payload).hexdigest() if payload is not None else None
-                previous_known = key in self.previous_hash
-                changed = previous_known and self.previous_hash[key] != digest
-                self.previous_hash[key] = digest
-                metadata = {
-                    "kind": "redis_observation",
-                    "sequence": self.sequence,
-                    "observed_at_utc": observed_utc,
-                    "monotonic_ns": observed_ns,
-                    "round_trip_ms": round(round_trip_ms, 3),
-                    "read_method": read_mode,
-                    "endpoint": endpoint,
-                    "key": key,
-                    "redis_type": key_types.get(key, "unknown"),
-                    "present": payload is not None,
-                    "changed": changed,
-                    "length": len(payload) if payload is not None else 0,
-                    "sha256": digest,
-                }
-                parsed, capture_error = self.capture.observe(
-                    "redis", payload, metadata,
-                    lambda key=key, payload=payload: decode_redis_payload(key, payload),
-                )
-                event = dict(metadata)
-                event.update({
-                    "type": "redis_observation",
-                    "parse": parsed,
-                    "raw_hex": payload.hex() if payload is not None else "",
-                })
-                self.bus.publish(event)
-                if capture_error:
-                    self._publish_log("ERROR", capture_error)
+                    # A later GET can disconnect; preserve each completed read now.
+                    self._observe_value(key, payload, endpoint, key_types, read_mode, request_started)
             elapsed = time.perf_counter() - started
             self.stop_event.wait(max(0.0, self.interval - elapsed))
 
@@ -1162,6 +1256,12 @@ class UdpWorker:
         self.recent_keys = set()
         self.recent_order = collections.deque()
         self.last_timestamp_by_vehicle = {}
+        self.sampler = UdpLatestSampler()
+        self.sample_lock = threading.RLock()
+        self.capture_generation = capture.generation
+        self.last_diagnostic_ns = 0
+        self.last_diagnostic_stats = {}
+        self.next_flush_ns = 0
 
     def start(self):
         self.thread.start()
@@ -1176,6 +1276,7 @@ class UdpWorker:
             except OSError:
                 pass
         self.thread.join(timeout=2.0)
+        return not self.thread.is_alive()
 
     def _publish_log(self, level, message):
         self.capture.log(level, message)
@@ -1243,80 +1344,97 @@ class UdpWorker:
                         pass
         self.bus.publish({"type": "udp_status", "status": "stopped", "detail": endpoint})
 
+    def _sync_capture_generation(self):
+        if self.capture_generation != self.capture.generation:
+            self.sampler.reset_pending()
+            self.capture_generation = self.capture.generation
+            self.last_diagnostic_stats = dict(self.sampler.stats)
+            self.next_flush_ns = 0
+
+    def flush_pending(self, force=True):
+        with self.sample_lock:
+            self._sync_capture_generation()
+            now_ns = time.monotonic_ns()
+            for snapshot in self.sampler.drain(now_ns, force=force):
+                payload = snapshot.pop("payload")
+                self.sequence += 1
+                metadata = dict(snapshot)
+                metadata.update(
+                    kind="udp_snapshot", sequence=self.sequence,
+                    listen_endpoint="%s:%d" % (self.group, self.port),
+                    length=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                    inter_arrival_ms=None, prefix_hex=payload[:24].hex(),
+                    sampling_interval_ms=1000)
+
+                def decode_selected():
+                    if snapshot.get("transport", {}).get("protocol") == "lcm" or snapshot.get("wire_hint", "").startswith("lcm"):
+                        transport = dict(snapshot.get("transport", {}))
+                        result = {
+                            "status": "lcm_reassembled" if transport.get("reassembled") else "lcm_unparsed",
+                            "decoded": None, "schema_verified": False, "transport": transport,
+                            "consumed_bytes": len(payload), "trailing_bytes": 0,
+                        }
+                    else:
+                        result = parse_udp_packet(payload)
+                    result["analysis"] = {
+                        "duplicate_count": snapshot.get("duplicate_count", 0),
+                        "coalesced_count": snapshot.get("coalesced_count", 0),
+                        "out_of_order_count": snapshot.get("out_of_order_count", 0),
+                        "sampling": "latest_complete_per_source_topic_1hz",
+                    }
+                    return result
+
+                parsed, capture_error = self.capture.observe("udp", payload, metadata, decode_selected)
+                event = dict(metadata)
+                event.update(type="udp_datagram", parse=parsed, raw_hex=payload[:2048].hex(),
+                             raw_preview_truncated=len(payload) > 2048)
+                self.bus.publish(event)
+                if capture_error:
+                    self._publish_log("ERROR", capture_error)
+            if force or now_ns - self.last_diagnostic_ns >= 1_000_000_000:
+                stats = dict(self.sampler.stats)
+                self.bus.publish({"type": "udp_metrics", "stats": stats})
+                delta = {key: value - self.last_diagnostic_stats.get(key, 0)
+                         for key, value in stats.items() if value != self.last_diagnostic_stats.get(key, 0)}
+                if delta:
+                    level = "WARN" if any(delta.get(key, 0) for key in ("invalid", "incomplete", "limit_dropped")) else "INFO"
+                    self.capture.log(level, "UDP sampling counters: " + json_text({
+                        "delta": delta, "total": stats, "total_scope": "receiver_lifetime"}, compact=True))
+                self.last_diagnostic_stats = stats
+                self.last_diagnostic_ns = now_ns
+            if force:
+                self.next_flush_ns = 0
+
     def _receive(self, sock, endpoint):
-        while not self.stop_event.is_set():
-            try:
-                payload, source = sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                if self.stop_event.is_set():
-                    return
-                raise
-            arrived_ns = time.monotonic_ns()
-            observed_utc = utc_now()
-            interval_ms = None
-            if self.previous_arrival_ns is not None:
-                interval_ms = (arrived_ns - self.previous_arrival_ns) / 1_000_000.0
-            self.previous_arrival_ns = arrived_ns
-            self.sequence += 1
-            digest = hashlib.sha256(payload).hexdigest()
-            metadata = {
-                "kind": "udp_datagram",
-                "sequence": self.sequence,
-                "observed_at_utc": observed_utc,
-                "monotonic_ns": arrived_ns,
-                "inter_arrival_ms": round(interval_ms, 3) if interval_ms is not None else None,
-                "source_ip": source[0],
-                "source_port": source[1],
-                "listen_endpoint": endpoint,
-                "length": len(payload),
-                "sha256": digest,
-                "prefix_hex": payload[:24].hex(),
-                "wire_hint": udp_wire_hint(payload),
-            }
-
-            def decode_and_tag():
-                parsed = parse_udp_packet(payload)
-                message = parsed.get("decoded")
-                key = "p:" + digest
-                out_of_order = False
-                if message:
-                    header = message["header"]
-                    stamp = header["stamp"]
-                    if message["vid"] or header["seq"] or stamp["sec"] or stamp["nsec"]:
-                        key = "m:%s:%s:%s:%s" % (
-                            message["vid"], header["seq"], stamp["sec"], stamp["nsec"])
-                    timestamp = stamp["sec"] * 1_000_000_000 + stamp["nsec"]
-                    if timestamp:
-                        previous = self.last_timestamp_by_vehicle.get(message["vid"])
-                        out_of_order = previous is not None and timestamp < previous
-                        if previous is None or timestamp >= previous:
-                            self.last_timestamp_by_vehicle[message["vid"]] = timestamp
-                duplicate = key in self.recent_keys
-                if not duplicate:
-                    self.recent_keys.add(key)
-                    self.recent_order.append(key)
-                    while len(self.recent_order) > 1024:
-                        self.recent_keys.discard(self.recent_order.popleft())
-                parsed["analysis"] = {
-                    "message_key": key,
-                    "duplicate": duplicate,
-                    "out_of_order": out_of_order,
-                    "accepted_for_capture": True,
-                }
-                return parsed
-
-            parsed, capture_error = self.capture.observe("udp", payload, metadata, decode_and_tag)
-            event = dict(metadata)
-            event.update({"type": "udp_datagram", "parse": parsed, "raw_hex": payload.hex()})
-            self.bus.publish(event)
-            if capture_error:
-                self._publish_log("ERROR", capture_error)
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    payload, source = sock.recvfrom(65535)
+                except socket.timeout:
+                    self.flush_pending(force=False)
+                    continue
+                except OSError:
+                    if self.stop_event.is_set():
+                        return
+                    raise
+                with self.sample_lock:
+                    self._sync_capture_generation()
+                    arrived_ns = time.monotonic_ns()
+                    self.sampler.ingest(payload, source, arrived_ns, utc_now())
+                    if arrived_ns >= self.next_flush_ns:
+                        self.flush_pending(force=False)
+                        self.next_flush_ns = arrived_ns + 1_000_000_000
+        finally:
+            self.flush_pending(force=True)
 
 
 def _short_time(iso_value):
-    return iso_value[11:23] if iso_value and len(iso_value) >= 23 else iso_value or ""
+    if iso_value:
+        try:
+            return dt.datetime.fromisoformat(iso_value.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S.%f")[:-3]
+        except (ValueError, TypeError):
+            pass
+    return iso_value or ""
 
 
 def _format_age(seconds):
@@ -1360,11 +1478,13 @@ class SmartDriverApp:
         }
 
         self.bus = UiEventBus()
-        self.capture = CaptureSession()
+        self.capture = DesktopCaptureSession()
         self.redis_worker = None
         self.udp_worker = None
+        self._applied_config = None
         self.redis_states = {}
         self.udp_events = collections.OrderedDict()
+        self.udp_metrics = {}
         self.counters = collections.Counter()
         self.inventory_count = 0
         self.inventory_method = "等待"
@@ -1428,12 +1548,13 @@ class SmartDriverApp:
 
         header = ttk.Frame(outer)
         header.pack(fill="x")
-        ttk.Label(header, text="SmartDriver 数据监看", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="现场监看与录制", style="Title.TLabel").pack(side="left")
         ttk.Label(
             header,
-            text="接收始终运行 · 显示实时更新 · 录制随时启停",
+            text="每秒更新最新状态 · 一次录制一个文件",
             style="Muted.TLabel",
         ).pack(side="left", padx=(16, 0), pady=(5, 0))
+        ttk.Button(header, text="打开录制文件", command=self.open_recording).pack(side="right")
 
         settings = ttk.Frame(outer, style="Surface.TFrame", padding=(10, 8))
         settings.pack(fill="x", pady=(10, 8))
@@ -1455,7 +1576,7 @@ class SmartDriverApp:
         self.record_button = ttk.Button(
             settings, text="开始录制", style="Accent.TButton", command=self.toggle_recording)
         self.record_button.grid(row=1, column=10, columnspan=2, padx=(0, 6), pady=(8, 0), sticky="ew")
-        ttk.Button(settings, text="打开最近目录", command=self.open_capture_directory).grid(
+        ttk.Button(settings, text="查看最近录制", command=self.open_capture_directory).grid(
             row=1, column=12, pady=(8, 0), sticky="ew")
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(7, weight=1)
@@ -1510,16 +1631,16 @@ class SmartDriverApp:
         ttk.Label(frame, text="判读提示", style="Title.TLabel").pack(anchor="w", pady=(22, 8))
         tips = (
             "1. Redis 的“最后观察”和“内容未变化”分开计时；后者持续增加时，Redis 可能只是保留旧值。\n"
-            "2. UDP 每个 datagram 都进入列表。解析失败、重复、乱序和尾随字节仅加标签，不会被隐藏或丢弃。\n"
+            "2. UDP 每秒每路保存最近的完整消息，中间消息会合并；没有新消息时不会新增记录。\n"
             "3. 红绿灯页逐条展示当前消息内的全部 trafficlights，不做距离、车道、方向或置信度筛选。\n"
-            "4. 未开始录制时前端仍持续更新；开始录制后原始字节先落盘，再执行解析。"
+            "4. 一次录制保存为一个 .sdlog 文件。停止后点击“查看最近录制”，按页查看数据和异常。"
         )
         ttk.Label(frame, text=tips, justify="left", wraplength=1050).pack(anchor="w")
 
     def _build_redis_tab(self, notebook):
         ttk = self.ttk
         frame = ttk.Frame(notebook, padding=8)
-        notebook.add(frame, text="Redis 全量")
+        notebook.add(frame, text="Redis 最新值")
         pane = ttk.Panedwindow(frame, orient="vertical")
         pane.pack(fill="both", expand=True)
         table_frame = ttk.Frame(pane)
@@ -1547,7 +1668,7 @@ class SmartDriverApp:
         table_frame.columnconfigure(0, weight=1)
         self._configure_row_tags(self.redis_tree)
         self.redis_tree.bind("<<TreeviewSelect>>", self._show_selected_redis)
-        ttk.Label(detail_frame, text="选中键的完整解析结果与原始十六进制", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(detail_frame, text="选中键查看明细，原始内容预览前 2048 字节", style="Muted.TLabel").pack(anchor="w")
         self.redis_detail = self._text_with_scroll(detail_frame)
 
     def _build_traffic_tab(self, notebook):
@@ -1574,26 +1695,25 @@ class SmartDriverApp:
     def _build_udp_tab(self, notebook):
         ttk = self.ttk
         frame = ttk.Frame(notebook, padding=8)
-        notebook.add(frame, text="UDP 全量")
+        notebook.add(frame, text="UDP 最新消息")
+        ttk.Label(frame, text="每路只显示最新完整消息；重复和中间消息按秒合并，缺失分片计入异常。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
         pane = ttk.Panedwindow(frame, orient="vertical")
         pane.pack(fill="both", expand=True)
         table_frame = ttk.Frame(pane)
         detail_frame = ttk.Frame(pane)
         pane.add(table_frame, weight=3)
         pane.add(detail_frame, weight=2)
-        columns = ("sequence", "time", "source", "bytes", "interval", "vid", "intent",
-                   "decision", "collab", "trajectory", "parse", "tags", "sha")
+        columns = ("topic", "source", "time", "age", "bytes", "received", "duplicate", "coalesced", "parse")
         self.udp_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         definitions = (
-            ("sequence", "序号", 60), ("time", "接收时间", 100), ("source", "来源", 145),
-            ("bytes", "字节", 60), ("interval", "相邻间隔 ms", 100), ("vid", "VID", 55),
-            ("intent", "意图", 55), ("decision", "决策", 55), ("collab", "协作车", 65),
-            ("trajectory", "轨迹点", 65), ("parse", "解析", 125), ("tags", "标签", 190),
-            ("sha", "SHA-256", 220),
+            ("topic", "话题", 290), ("source", "来源", 160), ("time", "最近接收", 100),
+            ("age", "距上次接收", 110), ("bytes", "字节", 75), ("received", "本轮报文", 80),
+            ("duplicate", "重复消息", 80), ("coalesced", "已合并", 80), ("parse", "状态", 160),
         )
         for key, title, width in definitions:
             self.udp_tree.heading(key, text=title)
-            self.udp_tree.column(key, width=width, anchor="w", stretch=key in ("tags", "sha"))
+            self.udp_tree.column(key, width=width, anchor="w", stretch=key in ("topic", "parse"))
         scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.udp_tree.yview)
         scroll_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.udp_tree.xview)
         self.udp_tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
@@ -1604,7 +1724,7 @@ class SmartDriverApp:
         table_frame.columnconfigure(0, weight=1)
         self._configure_row_tags(self.udp_tree)
         self.udp_tree.bind("<<TreeviewSelect>>", self._show_selected_udp)
-        ttk.Label(detail_frame, text="选中 datagram 的完整解析结果与原始十六进制", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(detail_frame, text="选中消息查看明细，原始内容预览前 2048 字节", style="Muted.TLabel").pack(anchor="w")
         self.udp_detail = self._text_with_scroll(detail_frame)
 
     def _build_log_tab(self, notebook):
@@ -1647,35 +1767,68 @@ class SmartDriverApp:
             self.udp_group.get(), self.udp_port.get(), self.udp_interface.get())
 
     def restart_workers(self):
+        if self.capture.active:
+            self.messagebox.showerror("请先停止录制", "录制中不能更改连接；请先停止录制，再应用并重连。", parent=self.root)
+            return
         try:
             config = self._validated_config()
         except Exception as exc:
             self.messagebox.showerror("连接设置错误", str(exc), parent=self.root)
             return
-        if self.redis_worker:
-            self.redis_worker.stop()
-        if self.udp_worker:
-            self.udp_worker.stop()
-        self.redis_worker = RedisWorker(
-            self.bus, self.capture, config["redis_host"], config["redis_port"],
-            config["redis_database"], interval=0.1, scan_interval=5.0)
-        self.udp_worker = UdpWorker(
-            self.bus, self.capture, config["udp_multicast"], config["udp_port"],
-            config["udp_interface"], route_host=config["redis_host"])
-        self.redis_worker.start()
-        self.udp_worker.start()
+        self._applied_config = None
+        stopping_errors = []
+        for worker in (self.redis_worker, self.udp_worker):
+            if worker is not None:
+                try:
+                    if not worker.stop():
+                        stopping_errors.append("旧接收线程尚未停止")
+                except Exception as exc:
+                    stopping_errors.append(str(exc))
+        if stopping_errors:
+            self.messagebox.showerror("无法重新连接", "；".join(stopping_errors), parent=self.root)
+            return
+        self.redis_worker = None
+        self.udp_worker = None
+        started = []
+        try:
+            redis_worker = RedisWorker(
+                self.bus, self.capture, config["redis_host"], config["redis_port"],
+                config["redis_database"], interval=config["redis_interval_ms"] / 1000.0, scan_interval=5.0)
+            udp_worker = UdpWorker(
+                self.bus, self.capture, config["udp_multicast"], config["udp_port"],
+                config["udp_interface"], route_host=config["redis_host"])
+            redis_worker.start()
+            started.append(("redis_worker", redis_worker))
+            udp_worker.start()
+            started.append(("udp_worker", udp_worker))
+        except Exception as exc:
+            for attribute, worker in started:
+                try:
+                    if not worker.stop():
+                        setattr(self, attribute, worker)
+                except Exception:
+                    setattr(self, attribute, worker)
+            self.messagebox.showerror("无法启动接收", str(exc), parent=self.root)
+            return
+        self.redis_worker = redis_worker
+        self.udp_worker = udp_worker
+        self._applied_config = dict(config)
         self._append_log("INFO", "已应用连接设置；Redis 和 UDP 后台接收已启动。", utc_now())
 
     def toggle_recording(self):
         if self.capture.active:
             try:
-                directory = self.capture.stop()
+                with getattr(self.udp_worker, "sample_lock", nullcontext()):
+                    flush = getattr(self.udp_worker, "flush_pending", None)
+                    if flush:
+                        flush()
+                    directory = self.capture.stop()
             except Exception as exc:
                 self.record_status.set("停止录制失败: " + str(exc))
                 self.messagebox.showerror("录制文件未完整收尾", str(exc), parent=self.root)
                 return
             self._last_capture_directory = directory
-            self.record_status.set("已停止: " + str(directory))
+            self.record_status.set("已停止，可查看最近录制")
             self.record_button.configure(text="开始录制", style="Accent.TButton")
             self._record_was_active = False
             self._append_log("INFO", "录制已停止: %s" % directory, utc_now())
@@ -1683,32 +1836,47 @@ class SmartDriverApp:
             return
         try:
             config = self._validated_config()
-            directory = self.capture.start(self.output_root.get().strip(), config)
+            if self._applied_config is None:
+                raise ValueError("请先应用连接设置，并成功启动 Redis 和 UDP 接收线程。")
+            if config != self._applied_config:
+                raise ValueError("连接设置尚未应用；请先点击“应用并重连”，再开始录制。")
+            with getattr(self.udp_worker, "sample_lock", nullcontext()):
+                directory = self.capture.start(self.output_root.get().strip(), self._applied_config)
+                sync = getattr(self.udp_worker, "_sync_capture_generation", None)
+                if sync:
+                    sync()
         except Exception as exc:
             self.messagebox.showerror("无法开始录制", str(exc), parent=self.root)
             return
         self._last_capture_directory = directory
-        self.record_status.set("录制中: " + str(directory))
+        self.record_status.set("录制中，每秒保存")
         self.record_button.configure(text="停止录制", style="Stop.TButton")
         self._record_was_active = True
         self._append_log("INFO", "录制已开始: %s" % directory, utc_now())
         self._update_overview()
 
     def open_capture_directory(self):
-        target = self._last_capture_directory or Path(self.output_root.get()).expanduser()
+        if self._last_capture_directory and Path(self._last_capture_directory).is_file():
+            self.open_recording(self._last_capture_directory)
+        else:
+            self.open_recording()
+
+    def open_recording(self, path=None):
+        if path is None:
+            path = self.filedialog.askopenfilename(
+                parent=self.root, title="打开录制文件",
+                initialdir=self.output_root.get() or str(Path.home()),
+                filetypes=[("SmartDriver 录制", "*.sdlog")])
+        if not path:
+            return
         try:
-            if os.name == "nt":
-                os.startfile(str(target))
-            elif sys.platform == "darwin":
-                import subprocess
-                subprocess.Popen(["open", str(target)])
-            else:
-                import subprocess
-                subprocess.Popen(["xdg-open", str(target)])
+            from log_viewer import LogViewer
+            LogViewer(self.root, path)
         except Exception as exc:
-            self.messagebox.showerror("无法打开目录", str(exc), parent=self.root)
+            self.messagebox.showerror("无法打开录制", str(exc), parent=self.root)
 
     def _process_events(self):
+        self.capture.tick()
         processed = 0
         while processed < 1000:
             try:
@@ -1727,11 +1895,11 @@ class SmartDriverApp:
             self.record_status.set("录制错误: " + (self.capture.last_error or "未知错误"))
             self._append_log("ERROR", self.capture.last_error or "录制意外停止", utc_now())
         self.metric_text.set(
-            "Redis观察 %d · Redis变化 %d · UDP %d · UDP解析失败 %d · UI丢弃 %d" % (
-                self.counters["redis"], self.counters["redis_changed"],
-                self.counters["udp"], self.counters["udp_parse_error"], self.bus.dropped))
+            "Redis %d · UDP 已采样 %d · 已合并 %d · 重复 %d" % (
+                self.counters["redis"], self.counters["udp"],
+                self.udp_metrics.get("coalesced", 0), self.udp_metrics.get("duplicate", 0)))
         self._update_overview()
-        self.root.after(10 if processed == 1000 else 100, self._process_events)
+        self.root.after(1000, self._process_events)
 
     def _handle_event(self, event):
         event_type = event.get("type")
@@ -1754,6 +1922,8 @@ class SmartDriverApp:
             self._handle_redis(event)
         elif event_type == "udp_datagram":
             self._handle_udp(event)
+        elif event_type == "udp_metrics":
+            self.udp_metrics = event["stats"]
 
     @staticmethod
     def _status_text(status, detail):
@@ -1824,6 +1994,8 @@ class SmartDriverApp:
     def _refresh_ages(self, now):
         for key, state in self.redis_states.items():
             self._upsert_redis_row(key, state, now)
+        for iid, event in self.udp_events.items():
+            self._upsert_udp_row(iid, event, now)
         traffic = self.redis_states.get("Sensor_TrafficLightlist")
         if traffic:
             self._set_traffic_status(traffic, now)
@@ -1837,7 +2009,7 @@ class SmartDriverApp:
 
     def _show_redis_state(self, state):
         detail = {key: value for key, value in state.items() if key not in ("raw_hex", "changed_monotonic")}
-        text = json_text(detail) + "\n\nRAW HEX (%d bytes)\n%s" % (
+        text = json_text(detail)[:65536] + "\n\nRAW HEX (预览前 2048 字节，共 %d 字节)\n%s" % (
             state["length"], _format_hex(state["raw_hex"]))
         self._replace_text(self.redis_detail, text)
 
@@ -1880,48 +2052,40 @@ class SmartDriverApp:
 
     def _handle_udp(self, event):
         self.counters["udp"] += 1
-        parsed = event["parse"]
-        if parsed["status"] == "parse_error":
+        if event["parse"]["status"] == "parse_error":
             self.counters["udp_parse_error"] += 1
-        analysis = parsed.get("analysis", {})
-        message = parsed.get("decoded") or {}
-        tags = []
-        if analysis.get("duplicate"):
-            tags.append("重复（未丢弃）")
-        if analysis.get("out_of_order"):
-            tags.append("乱序（未丢弃）")
-        if parsed.get("trailing_bytes"):
-            tags.append("尾随%d字节（未丢弃）" % parsed["trailing_bytes"])
-        if event["wire_hint"] != "direct-or-unknown":
-            tags.append(event["wire_hint"])
-        if parsed.get("issues"):
-            tags.append("字段异常")
-        iid = "%s-%s" % (event["monotonic_ns"], event["sequence"])
-        values = (
-            event["sequence"],
-            _short_time(event["observed_at_utc"]),
-            "%s:%s" % (event["source_ip"], event["source_port"]),
-            event["length"],
-            "—" if event["inter_arrival_ms"] is None else "%.3f" % event["inter_arrival_ms"],
-            message.get("vid", ""),
-            message.get("driving_intention", ""),
-            message.get("guide_decision", ""),
-            len(message.get("collaborative_vehicle_list", [])),
-            len(message.get("intend_trajectory_points", [])),
-            parsed["status"],
-            "；".join(tags),
-            event["sha256"],
-        )
-        row_tag = "error" if parsed["status"] == "parse_error" else "warning" if tags else "changed"
-        had_selection = bool(self.udp_tree.selection())
-        self.udp_tree.insert("", "end", iid=iid, values=values, tags=(row_tag,))
+        iid = event.get("stream_key") or "%s:%s" % (event["source_ip"], event["source_port"])
         self.udp_events[iid] = event
-        while len(self.udp_events) > 500:
-            old_iid, _old_event = self.udp_events.popitem(last=False)
+        self.udp_events.move_to_end(iid)
+        self._upsert_udp_row(iid, event, time.monotonic())
+        while len(self.udp_events) > 128:
+            old_iid, _ = self.udp_events.popitem(last=False)
             if self.udp_tree.exists(old_iid):
                 self.udp_tree.delete(old_iid)
-        if not had_selection:
-            self.udp_tree.yview_moveto(1.0)
+        if self.udp_tree.selection() == (iid,):
+            self._show_selected_udp()
+
+    def _upsert_udp_row(self, iid, event, now):
+        age = max(0.0, now - event["monotonic_ns"] / 1_000_000_000)
+        parsed = event["parse"]
+        status = {
+            "lcm_unparsed": "已收齐，业务未解码",
+            "lcm_reassembled": "已重组，业务未解码",
+            "parse_error": "解析失败", "ok": "可解析", "ok_with_trailing": "含尾随字节",
+        }.get(parsed["status"], parsed["status"])
+        if age >= 3:
+            status = "超过 %d 秒未更新" % age
+        values = (
+            event.get("topic") or event.get("transport", {}).get("channel") or "未识别 UDP",
+            "%s:%s" % (event["source_ip"], event["source_port"]),
+            _short_time(event["observed_at_utc"]), _format_age(age), event["length"],
+            event.get("received_count", 1), event.get("duplicate_count", 0),
+            event.get("coalesced_count", 0), status)
+        tag = "error" if parsed["status"] == "parse_error" else "critical" if age >= 10 else "warning" if age >= 3 else "changed"
+        if self.udp_tree.exists(iid):
+            self.udp_tree.item(iid, values=values, tags=(tag,))
+        else:
+            self.udp_tree.insert("", "end", iid=iid, values=values, tags=(tag,))
 
     def _show_selected_udp(self, _event=None):
         selected = self.udp_tree.selection()
@@ -1931,7 +2095,7 @@ class SmartDriverApp:
         if not event:
             return
         detail = {key: value for key, value in event.items() if key != "raw_hex"}
-        text = json_text(detail) + "\n\nRAW HEX (%d bytes)\n%s" % (
+        text = json_text(detail)[:65536] + "\n\nRAW HEX (预览前 2048 字节，共 %d 字节)\n%s" % (
             event["length"], _format_hex(event["raw_hex"]))
         self._replace_text(self.udp_detail, text)
 
@@ -1960,20 +2124,33 @@ class SmartDriverApp:
                 len(UNITY_REDIS_KEYS), self.counters["redis_parse_error"])))
         self.overview_tree.item("udp", values=(
             "UDP " + self.udp_port.get(), udp_state, self.counters["udp"],
-            "解析失败 %d；所有 datagram 均保留" % self.counters["udp_parse_error"]))
+            "收到 %d 包；重复 %d；迟到 %d；无效 %d；缺失消息 %d；超限 %d；界面略过 %d" % (
+                self.udp_metrics.get("received", 0), self.udp_metrics.get("duplicate", 0),
+                self.udp_metrics.get("out_of_order", 0), self.udp_metrics.get("invalid", 0),
+                self.udp_metrics.get("incomplete", 0), self.udp_metrics.get("limit_dropped", 0), self.bus.dropped)))
         self.overview_tree.item("record", values=(
             "磁盘录制", record_state,
             self.capture.counts.get("redis", 0) + self.capture.counts.get("udp", 0),
-            str(self.capture.directory or "尚未创建录制目录")))
+            str(self.capture.directory or "尚未创建录制文件")))
 
     def close(self):
+        stopping_errors = []
+        for worker in (self.redis_worker, self.udp_worker):
+            if worker is not None:
+                try:
+                    if not worker.stop():
+                        stopping_errors.append("接收线程尚未停止，请重试关闭")
+                except Exception as exc:
+                    stopping_errors.append(str(exc))
+        if stopping_errors:
+            self._applied_config = None
+            self.messagebox.showerror("无法关闭", "；".join(stopping_errors), parent=self.root)
+            return
         try:
             self.capture.stop()
+        except Exception as exc:
+            self.messagebox.showerror("录制文件未完整收尾", str(exc), parent=self.root)
         finally:
-            if self.redis_worker:
-                self.redis_worker.stop()
-            if self.udp_worker:
-                self.udp_worker.stop()
             self.root.destroy()
 
 
@@ -1981,7 +2158,7 @@ def run_headless(config, output_root, duration_seconds=0, archive=False):
     if duration_seconds < 0:
         raise ValueError("duration must be zero or greater")
     bus = UiEventBus()
-    capture = CaptureSession()
+    capture = DesktopCaptureSession()
     directory = capture.start(output_root, config)
     redis_worker = RedisWorker(
         bus, capture, config["redis_host"], config["redis_port"],
@@ -1990,12 +2167,16 @@ def run_headless(config, output_root, duration_seconds=0, archive=False):
     udp_worker = UdpWorker(
         bus, capture, config["udp_multicast"], config["udp_port"],
         config["udp_interface"], route_host=config["redis_host"])
-    redis_worker.start()
-    udp_worker.start()
-    print("CAPTURE_DIR=" + str(directory), flush=True)
-    deadline = time.monotonic() + duration_seconds if duration_seconds else None
+    started = []
     try:
+        redis_worker.start()
+        started.append(redis_worker)
+        udp_worker.start()
+        started.append(udp_worker)
+        print("CAPTURE_FILE=" + str(directory), flush=True)
+        deadline = time.monotonic() + duration_seconds if duration_seconds else None
         while deadline is None or time.monotonic() < deadline:
+            capture.tick()
             if capture.last_error:
                 raise RuntimeError(capture.last_error)
             timeout = 0.25 if deadline is None else min(0.25, max(0.0, deadline - time.monotonic()))
@@ -2009,14 +2190,27 @@ def run_headless(config, output_root, duration_seconds=0, archive=False):
                 print(json_text(event, compact=True), flush=True)
     except KeyboardInterrupt:
         print("STOP_REQUESTED=keyboard_interrupt", flush=True)
+    except Exception as exc:
+        with capture.lock:
+            capture.last_error = capture.last_error or "capture failed: %s" % exc
+        raise
     finally:
         finalization_error = None
+        for worker in started:
+            try:
+                if not worker.stop():
+                    raise RuntimeError("capture receiver did not stop")
+            except Exception as exc:
+                finalization_error = finalization_error or exc
+        if finalization_error is not None or capture.last_error:
+            with capture.lock:
+                if finalization_error is not None:
+                    capture.last_error = "capture receiver shutdown failed: %s" % finalization_error
+                capture._abort_locked()
         try:
             capture.stop()
         except Exception as exc:
-            finalization_error = exc
-        redis_worker.stop()
-        udp_worker.stop()
+            finalization_error = finalization_error or exc
         if finalization_error:
             raise finalization_error
     if capture.last_error:
@@ -2082,6 +2276,14 @@ def run_self_test():
         DEFAULT_REDIS_HOST, DEFAULT_REDIS_PORT, DEFAULT_REDIS_DATABASE,
         DEFAULT_UDP_GROUP, DEFAULT_UDP_PORT,
     ) == ("192.168.2.112", 6379, 0, "239.255.76.21", 7621)
+    assert REDIS_INTERVAL_SECONDS == 1.0
+    assert validate_capture_config(
+        "127.0.0.1", 6379, 0, DEFAULT_UDP_GROUP, 7621, "auto")["redis_interval_ms"] == 1000
+
+    lcm = parse_udp_packet(b"LC02" + struct.pack(">I", 23) + b"/test\0" + b"12345678body")
+    assert lcm["status"] == "lcm_unparsed" and lcm["decoded"] is None
+    assert lcm["transport"]["channel"] == "/test" and not lcm["schema_verified"]
+    assert parse_udp_packet(b"LC03")["status"] == "parse_error"
 
     light = b"".join((
         _protobuf_varint(1, 2),
@@ -2278,7 +2480,13 @@ def run_network_self_test():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
             sender.sendto(_test_udp_payload(), ("127.0.0.1", udp_port))
-        udp_event = udp_bus.queue.get(timeout=2.0)
+        deadline = time.monotonic() + 3.0
+        while True:
+            udp_event = udp_bus.queue.get(timeout=max(0.01, deadline - time.monotonic()))
+            if udp_event["type"] == "udp_datagram":
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("UDP sample did not arrive")
     finally:
         udp_worker.stop_event.set()
         udp_socket.close()
@@ -2296,8 +2504,8 @@ def main(argv=None):
         "--network-self-test", action="store_true",
         help="run loopback Redis/UDP socket checks without contacting field systems")
     mode.add_argument("--headless", action="store_true", help="record without Tk; works on Linux and Windows")
-    mode.add_argument("--verify-capture", metavar="DIR", help="verify a completed capture directory")
-    mode.add_argument("--pack-capture", metavar="DIR", help="verify and create a transferable ZIP")
+    mode.add_argument("--verify-capture", metavar="PATH", help="verify a completed .sdlog or legacy capture directory")
+    mode.add_argument("--pack-capture", metavar="PATH", help="verify a .sdlog or legacy directory and create a ZIP")
     parser.add_argument("--redis-host", default=DEFAULT_REDIS_HOST)
     parser.add_argument("--redis-port", default=DEFAULT_REDIS_PORT, type=int)
     parser.add_argument("--redis-database", default=DEFAULT_REDIS_DATABASE, type=int)
